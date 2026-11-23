@@ -6,7 +6,7 @@ struct SubtitleSettingsDrawer: View {
     let style: SubtitleStyleConfig
     let subtitleName: String?
     let hasSubtitle: Bool
-    let onStyleChange: (@Sendable (inout SubtitleStyleConfig) -> Void) -> Void
+    let onStyleChange: (@escaping @Sendable (inout SubtitleStyleConfig) -> Void) -> Void
     let onClose: () -> Void
 
     var body: some View {

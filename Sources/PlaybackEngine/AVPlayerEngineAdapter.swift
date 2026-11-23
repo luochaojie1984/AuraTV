@@ -15,7 +15,7 @@ import Combine
 public final class AVPlayerEngineAdapter: NSObject, ObservableObject, PlayerEngineProtocol {
     private let player = AVPlayer()
     private var currentItem: AVPlayerItem?
-    private var timeObserver: Any?
+    nonisolated(unsafe) private var timeObserver: Any?
     private var loadedDuration: TimeInterval = 0
     private var readBytes: Int64 = 0
     private var loadStart: Date?
@@ -49,8 +49,11 @@ public final class AVPlayerEngineAdapter: NSObject, ObservableObject, PlayerEngi
     private func installTimeObserver() {
         let interval = CMTime(seconds: 0.25, preferredTimescale: 600)
         timeObserver = player.addPeriodicTimeObserver(forInterval: interval, queue: .main) { [weak self] time in
-            guard let self else { return }
-            self.currentTime = CMTimeGetSeconds(time).isFinite ? CMTimeGetSeconds(time) : 0
+            let seconds = CMTimeGetSeconds(time)
+            Task { @MainActor in
+                guard let self else { return }
+                self.currentTime = seconds.isFinite ? seconds : 0
+            }
         }
     }
 
