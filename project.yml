@@ -3,15 +3,24 @@ options:
   bundleIdPrefix: local.personal
   deploymentTarget:
     tvOS: "17.0"
+  createIntermediateGroups: true
 packages:
   MediaCoreKit:
     path: Packages/MediaCoreKit
+  AMSMB2:
+    url: https://github.com/amosavian/AMSMB2.git
+    exactVersion: 4.0.3
+  KSPlayer:
+    url: https://github.com/kingslay/KSPlayer.git
+    exactVersion: 5.6.2
 targets:
   AuraTV:
     type: application
     platform: tvOS
     sources:
       - path: Sources/TVApp
+      - path: Sources/TVAdapters
+      - path: Sources/PlaybackEngine
     dependencies:
       - package: MediaCoreKit
         product: NetworkVFS
@@ -21,6 +30,10 @@ targets:
         product: SubtitleKit
       - package: MediaCoreKit
         product: AppPreferences
+      - package: AMSMB2
+        product: AMSMB2
+      - package: KSPlayer
+        product: KSPlayer
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: local.personal.auratv
