@@ -178,12 +178,22 @@ private final class WebDAVPropfindParser: NSObject, XMLParserDelegate {
     private static func extractDecodedPath(from href: String) -> String {
         let trimmed = href.trimmingCharacters(in: .whitespacesAndNewlines)
         let rawPath: String
-        if let url = URL(string: trimmed), url.scheme != nil {
-            rawPath = url.path
+        if trimmed.lowercased().hasPrefix("http://") || trimmed.lowercased().hasPrefix("https://") {
+            if let schemeEnd = trimmed.range(of: "://") {
+                let afterScheme = trimmed[schemeEnd.upperBound...]
+                if let firstSlash = afterScheme.firstIndex(of: "/") {
+                    rawPath = String(afterScheme[firstSlash...])
+                } else {
+                    rawPath = "/"
+                }
+            } else {
+                rawPath = trimmed
+            }
         } else {
             rawPath = trimmed
         }
-        return rawPath.removingPercentEncoding ?? rawPath
+        let decoded = rawPath.removingPercentEncoding ?? rawPath
+        return decoded.precomposedStringWithCanonicalMapping
     }
 
     private static func normalizeDirPath(_ path: String) -> String {
@@ -523,7 +533,21 @@ public final class WebDAVProvider: VFSProvider, @unchecked Sendable {
         if isDirectory && !finalPath.hasSuffix("/") {
             finalPath += "/"
         }
-        components.path = finalPath
+        // Encode each path segment individually with RFC 3986 path-segment rules so literal
+        // '#', '?', '%', '&', '+', '[', ']', spaces, Japanese and Chinese characters are safely preserved.
+        var allowed = CharacterSet.urlPathAllowed
+        allowed.remove(charactersIn: "/?#%[]+&;")
+        let trailingSlash = finalPath.hasSuffix("/") && finalPath.count > 1
+        let encodedSegments = finalPath
+            .split(separator: "/", omittingEmptySubsequences: true)
+            .map { segment -> String in
+                String(segment).addingPercentEncoding(withAllowedCharacters: allowed) ?? String(segment)
+            }
+        var encodedPath = "/" + encodedSegments.joined(separator: "/")
+        if trailingSlash && !encodedPath.hasSuffix("/") {
+            encodedPath += "/"
+        }
+        components.percentEncodedPath = encodedPath
 
         guard let url = components.url else {
             throw VFSError.invalidURL(finalPath)

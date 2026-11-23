@@ -20,7 +20,7 @@ let package = Package(
         .target(name: "AppPreferences", dependencies: ["NetworkVFS", "SubtitleKit"]),
         .testTarget(name: "NetworkVFSTests", dependencies: ["NetworkVFS"]),
         .testTarget(name: "LocalStreamProxyTests", dependencies: ["LocalStreamProxy"]),
-        .testTarget(name: "SubtitleKitTests", dependencies: ["SubtitleKit"]),
+        .testTarget(name: "SubtitleKitTests", dependencies: ["SubtitleKit", "NetworkVFS", "LocalStreamProxy", "AppPreferences"]),
         .testTarget(name: "AppPreferencesTests", dependencies: ["AppPreferences"]),
     ]
 )

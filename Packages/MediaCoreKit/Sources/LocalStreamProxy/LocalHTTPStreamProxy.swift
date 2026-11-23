@@ -167,8 +167,12 @@ public final class LocalHTTPStreamProxy: @unchecked Sendable {
         streams[token] = RegisteredStreamEntry(stream: effectiveStream, contentType: mime)
         lock.unlock()
 
-        let safeName = fileName.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? "video.mkv"
-        let url = URL(string: "http://127.0.0.1:\(currentPort)/stream/\(token)/\(safeName)")!
+        // Always use short ASCII path (/stream/<token>.<ext>) so 255-byte CJK/Japanese/symbol
+        // filenames (# ? % & + [ ] 【】) NEVER break FFmpeg/AVPlayer/KSPlayer URL parsing.
+        let rawExt = URL(fileURLWithPath: fileName).pathExtension.lowercased()
+        let safeExt = rawExt.filter { $0.isASCII && ($0.isLetter || $0.isNumber) }
+        let extSuffix = safeExt.isEmpty ? "bin" : safeExt
+        let url = URL(string: "http://127.0.0.1:\(currentPort)/stream/\(token).\(extSuffix)")!
         return (token, url)
     }
 
@@ -227,10 +231,12 @@ public final class LocalHTTPStreamProxy: @unchecked Sendable {
             return
         }
 
-        // Expect path: /stream/<token>/<filename>
+        // Expect path: /stream/<token>.<ext> (or legacy /stream/<token>/<filename>)
         let segments = request.path.split(separator: "/", omittingEmptySubsequences: true)
+        let rawTokenSegment = segments.count >= 2 ? String(segments[1]) : ""
+        let tokenKey = rawTokenSegment.split(separator: ".", maxSplits: 1).first.map(String.init) ?? rawTokenSegment
         guard segments.count >= 2, segments[0] == "stream",
-              let entry = lookupStream(token: String(segments[1])) else {
+              let entry = lookupStream(token: tokenKey) else {
             _ = sendAll(fd: fd, data: makeHeaderResponse(status: "404 Not Found", headers: ["Content-Length": "0"]))
             return
         }

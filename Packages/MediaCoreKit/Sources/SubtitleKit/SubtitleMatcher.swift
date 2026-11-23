@@ -109,7 +109,11 @@ public enum SubtitleMatcher {
     }
 
     private static func stripExtension(_ name: String) -> String {
-        URL(fileURLWithPath: name).deletingPathExtension().lastPathComponent
+        let normalized = name.precomposedStringWithCanonicalMapping
+        guard let dotIdx = normalized.lastIndex(of: "."), dotIdx != normalized.startIndex else {
+            return normalized
+        }
+        return String(normalized[..<dotIdx])
     }
 
     private static func stripLanguageSuffixes(from stem: String) -> String {
@@ -165,16 +169,32 @@ public enum SubtitleMatcher {
     }
 
     private static func extractEpisodeTag(from text: String) -> String? {
-        // Match S01E02 or 1x02
-        let pattern = #"s(\d{1,2})e(\d{1,3})"#
-        if let regex = try? NSRegularExpression(pattern: pattern, options: [.caseInsensitive]) {
-            let range = NSRange(text.startIndex..., in: text)
-            if let match = regex.firstMatch(in: text, range: range),
-               let r1 = Range(match.range(at: 1), in: text),
-               let r2 = Range(match.range(at: 2), in: text),
-               let season = Int(text[r1]),
-               let ep = Int(text[r2]) {
+        let normalized = text.precomposedStringWithCanonicalMapping
+        // 1. S01E02
+        if let regex = try? NSRegularExpression(pattern: #"s(\d{1,2})e(\d{1,3})"#, options: [.caseInsensitive]) {
+            let range = NSRange(normalized.startIndex..., in: normalized)
+            if let match = regex.firstMatch(in: normalized, range: range),
+               let r1 = Range(match.range(at: 1), in: normalized),
+               let r2 = Range(match.range(at: 2), in: normalized),
+               let season = Int(normalized[r1]),
+               let ep = Int(normalized[r2]) {
                 return String(format: "S%02dE%02d", season, ep)
+            }
+        }
+        // 2. Japanese/Chinese/Anime episode tags: 第01話 / 第12集 / EP05 / #03
+        let singlePatterns = [
+            #"第\s*(\d{1,3})\s*[話话集回]"#,
+            #"(?:^|[\s\[\(\.\-_【（])ep\s*(\d{1,3})(?:$|[\s\]\)\.\-_】）])"#,
+            #"#(\d{1,3})(?:$|[\s\]\)\.\-_】）])"#
+        ]
+        for pat in singlePatterns {
+            if let regex = try? NSRegularExpression(pattern: pat, options: [.caseInsensitive]) {
+                let range = NSRange(normalized.startIndex..., in: normalized)
+                if let match = regex.firstMatch(in: normalized, range: range),
+                   let r1 = Range(match.range(at: 1), in: normalized),
+                   let ep = Int(normalized[r1]) {
+                    return String(format: "EP%03d", ep)
+                }
             }
         }
         return nil
