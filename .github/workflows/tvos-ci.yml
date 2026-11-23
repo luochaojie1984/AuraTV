@@ -1,4 +1,4 @@
-name: AuraTV CI (Ubuntu Tests + tvOS Unsigned IPA)
+name: AuraTV CI (Ubuntu Tests + tvOS 27 Unsigned IPA & Preview)
 
 on:
   push:
@@ -19,14 +19,18 @@ jobs:
 
   build-tvos-unsigned-ipa:
     needs: core-tests-ubuntu
-    runs-on: macos-latest
+    runs-on: xcode-27
     steps:
       - uses: actions/checkout@v4
+      - name: Check Xcode 27 & tvOS 27 SDK
+        run: |
+          xcodebuild -version
+          xcodebuild -showsdks | grep appletvos
       - name: Install XcodeGen
         run: brew install xcodegen
       - name: Generate Xcode Project
         run: xcodegen generate
-      - name: Build tvOS Release App (Unsigned)
+      - name: Build tvOS 27 Release App (Unsigned)
         run: |
           xcodebuild clean build \
             -project AuraTV.xcodeproj \
@@ -36,7 +40,7 @@ jobs:
             -configuration Release \
             CODE_SIGNING_ALLOWED=NO \
             CODE_SIGNING_REQUIRED=NO \
-            CODE_SIGN_IDENTITY="" \
+            CODE_SIGNING_IDENTITY="" \
             SYMROOT="$(pwd)/build"
       - name: Package Unsigned IPA
         run: |
@@ -49,3 +53,35 @@ jobs:
         with:
           name: AuraTV-Unsigned-tvOS-IPA
           path: AuraTV-Unsigned.ipa
+
+  preview-tvos-screenshots:
+    needs: core-tests-ubuntu
+    if: github.event_name == 'workflow_dispatch' || contains(github.event.head_commit.message, '[preview]')
+    runs-on: xcode-27
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install XcodeGen & Generate Project
+        run: |
+          brew install xcodegen
+          xcodegen generate
+      - name: Build for tvOS 27 Simulator & Capture Screenshot
+        run: |
+          SIM_UDID=$(xcrun simctl list devices available -j | python3 -c "import sys,json; d=json.load(sys.stdin)['devices']; tv=[x['udid'] for k,v in d.items() if 'tvOS' in k for x in v if 'Apple TV 4K' in x['name']]; print(tv[0])")
+          xcrun simctl boot "$SIM_UDID" || true
+          xcodebuild build \
+            -project AuraTV.xcodeproj \
+            -scheme AuraTV \
+            -sdk appletvsimulator \
+            -destination "id=$SIM_UDID" \
+            -configuration Debug \
+            SYMROOT="$(pwd)/sim-build"
+          xcrun simctl install "$SIM_UDID" "sim-build/Debug-appletvsimulator/AuraTV.app"
+          xcrun simctl launch "$SIM_UDID" local.personal.auratv
+          sleep 5
+          mkdir -p screenshots
+          xcrun simctl io "$SIM_UDID" screenshot screenshots/home-tvos27.png
+      - name: Upload UI Preview Screenshots (Viewable on Windows)
+        uses: actions/upload-artifact@v4
+        with:
+          name: AuraTV-tvOS27-UI-Previews
+          path: screenshots/*.png

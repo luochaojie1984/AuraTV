@@ -8,7 +8,7 @@
 
 ### 1.1 产品定位与功能范围
 
-- **目标平台**：Apple TV 4K（原生 tvOS 17.0+，在 tvOS 26+ 自动启用 Liquid Glass）。
+- **目标平台**：Apple TV 4K（真机系统为最新 **tvOS 27**；工程最低兼容 `tvOS 17.0+`，在 tvOS 26/27 自动启用原生 Liquid Glass）。
 - **用户性质**：**个人自用**，有 Apple TV 真机 + **免费 Apple ID（无 \$99 付费开发者账号）**。
 - **核心功能（必须实现）**：
   1. **原生精美暗色客厅 UI**：Liquid Glass / 毛玻璃质感、安全区规范、Siri Remote 顺滑焦点引擎、局域网文件浏览与「继续观看」首页。
@@ -27,8 +27,8 @@
 | :--- | :--- | :--- |
 | **主力开发机** | Ubuntu 24.04.5 LTS (`192.168.5.157`, 用户 `lcj`) | AMD EPYC 48 线程 / 125GB 内存 / Docker 运行中。**源码必须放在 `/data/projects/AuraTV`**（`/data` 余 529G；不要把大文件塞在 `/`） |
 | **局域网 SMB 测试环境** | `192.168.5.0/24` 同网段（已有 SMB 服务） | 仅作只读测试，**严禁删除、修改或写入用户任何现有媒体文件** |
-| **tvOS 编译机** | GitHub Actions (`macos-latest` Apple Silicon) | 每次 `git push` 自动运行 `xcodegen` + `xcodebuild` 生成 `AuraTV-Unsigned.ipa` |
-| **无线安装与自动续签** | `192.168.5.157` 上的 Docker (`bitxeno/atvloadly`) | 通过宿主机 `avahi-daemon` 发现 Apple TV，用免费 Apple ID 签名推送并每 7 天后台自动续签 |
+| **tvOS 编译机** | GitHub Actions (`xcode-27` Apple Silicon) | 每次 `git push` 自动用 **Xcode 27 + tvOS 27 SDK** 生成 `AuraTV-Unsigned.ipa`，并可按需自动运行 tvOS 27 无头模拟器导出 UI 预览截图供 Windows 浏览器查看 |
+| **无线安装与自动续签** | OpenWrt 不关机路由器（Docker + `avahi-dbus-daemon`）或 `192.168.5.157` Docker (`bitxeno/atvloadly`) | 通过宿主机 Avahi 发现 Apple TV，用免费 Apple ID 签名推送并每 7 天后台全自动续签（**推荐将常驻续签迁移到 24 小时不关机的 OpenWrt 路由器**） |
 
 ### 1.3 给执行 AI 的 10 条铁律（Guardrails）
 
@@ -270,9 +270,13 @@ bash /data/projects/AuraTV/Scripts/setup-ubuntu-ai.sh
 
        build-tvos-unsigned-ipa:
          needs: core-tests-ubuntu
-         runs-on: macos-latest
+         runs-on: xcode-27
          steps:
            - uses: actions/checkout@v4
+           - name: Check Xcode 27 & tvOS 27 SDK
+             run: |
+               xcodebuild -version
+               xcodebuild -showsdks | grep appletvos
            - name: Install XcodeGen
              run: brew install xcodegen
            - name: Generate Xcode Project
@@ -300,6 +304,38 @@ bash /data/projects/AuraTV/Scripts/setup-ubuntu-ai.sh
              with:
                name: AuraTV-Unsigned-tvOS-IPA
                path: AuraTV-Unsigned.ipa
+
+       preview-tvos-screenshots:
+         needs: core-tests-ubuntu
+         if: github.event_name == 'workflow_dispatch' || contains(github.event.head_commit.message, '[preview]')
+         runs-on: xcode-27
+         steps:
+           - uses: actions/checkout@v4
+           - name: Install XcodeGen & Generate Project
+             run: |
+               brew install xcodegen
+               xcodegen generate
+           - name: Build for tvOS 27 Simulator & Capture Screenshot
+             run: |
+               SIM_UDID=$(xcrun simctl list devices available -j | python3 -c "import sys,json; d=json.load(sys.stdin)['devices']; tv=[x['udid'] for k,v in d.items() if 'tvOS' in k for x in v if 'Apple TV 4K' in x['name']]; print(tv[0])")
+               xcrun simctl boot "$SIM_UDID" || true
+               xcodebuild build \
+                 -project AuraTV.xcodeproj \
+                 -scheme AuraTV \
+                 -sdk appletvsimulator \
+                 -destination "id=$SIM_UDID" \
+                 -configuration Debug \
+                 SYMROOT="$(pwd)/sim-build"
+               xcrun simctl install "$SIM_UDID" "sim-build/Debug-appletvsimulator/AuraTV.app"
+               xcrun simctl launch "$SIM_UDID" local.personal.auratv
+               sleep 5
+               mkdir -p screenshots
+               xcrun simctl io "$SIM_UDID" screenshot screenshots/home-tvos27.png
+           - name: Upload UI Preview Screenshots (Viewable on Windows)
+             uses: actions/upload-artifact@v4
+             with:
+               name: AuraTV-tvOS27-UI-Previews
+               path: screenshots/*.png
      ```
 - **验收标准**：
   - 在 `192.168.5.157` 运行 `cd /data/projects/AuraTV/Packages/MediaCoreKit && swift test` 全部通过。
@@ -329,6 +365,24 @@ sudo mkdir -p /data/atvloadly && sudo chown -R lcj:lcj /data/atvloadly
 cd /data/projects/AuraTV/Scripts/deploy
 docker compose -f docker-compose.atvloadly.yml up -d
 ```
+
+> **OpenWrt 不关机路由器部署方案（推荐用于长期 24/7 自动续签）**：
+> - 前提：OpenWrt 为 `x86_64` 或 `arm64` 架构软路由/硬路由，且已启用 Docker 并预留 ≥ 300MB 持久化存储（外接 U 盘或 overlay 分区）。
+> - 在 OpenWrt SSH 中执行仓库内的 `Scripts/deploy/openwrt-atvloadly.sh`：
+>   ```bash
+>   opkg update && opkg install avahi-dbus-daemon dbus
+>   /etc/init.d/dbus enable && /etc/init.d/dbus start
+>   /etc/init.d/avahi-daemon enable && /etc/init.d/avahi-daemon start
+>   mkdir -p /mnt/data/atvloadly
+>   docker run -d --name atvloadly --restart always \
+>     --security-opt seccomp:unconfined \
+>     -p 5533:80 \
+>     -v /mnt/data/atvloadly:/data \
+>     -v /var/run/dbus:/var/run/dbus \
+>     -v /var/run/avahi-daemon:/var/run/avahi-daemon \
+>     bitxeno/atvloadly:latest
+>   ```
+> - 若未来从 `192.168.5.157` 迁移到 OpenWrt，只需停止旧容器并将 `/data/atvloadly` 整个目录拷贝到 OpenWrt 的挂载目录再启动即可，配对记录与续签证书无缝继承。
 - **人工配合验收标准**：
   1. 浏览器访问 `http://192.168.5.157:5533`，发现局域网内的 Apple TV 4K 并完成配对；
   2. 登录专用免费 Apple ID，上传 Step 0.2 产出的 `AuraTV-Unsigned.ipa`；
