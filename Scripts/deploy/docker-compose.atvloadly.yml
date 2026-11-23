@@ -1,0 +1,13 @@
+services:
+  atvloadly:
+    image: bitxeno/atvloadly:latest
+    container_name: atvloadly
+    restart: unless-stopped
+    security_opt:
+      - seccomp:unconfined
+    ports:
+      - "5533:80"
+    volumes:
+      - /data/atvloadly:/data
+      - /var/run/dbus:/var/run/dbus
+      - /var/run/avahi-daemon:/var/run/avahi-daemon

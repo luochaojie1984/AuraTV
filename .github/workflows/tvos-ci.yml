@@ -1,0 +1,51 @@
+name: AuraTV CI (Ubuntu Tests + tvOS Unsigned IPA)
+
+on:
+  push:
+    branches: [ main, develop ]
+  workflow_dispatch:
+
+jobs:
+  core-tests-ubuntu:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: swift-actions/setup-swift@v2
+        with:
+          swift-version: "6.0"
+      - name: Test MediaCoreKit on Linux
+        working-directory: Packages/MediaCoreKit
+        run: swift test --parallel
+
+  build-tvos-unsigned-ipa:
+    needs: core-tests-ubuntu
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install XcodeGen
+        run: brew install xcodegen
+      - name: Generate Xcode Project
+        run: xcodegen generate
+      - name: Build tvOS Release App (Unsigned)
+        run: |
+          xcodebuild clean build \
+            -project AuraTV.xcodeproj \
+            -scheme AuraTV \
+            -sdk appletvos \
+            -destination 'generic/platform=tvOS' \
+            -configuration Release \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            SYMROOT="$(pwd)/build"
+      - name: Package Unsigned IPA
+        run: |
+          mkdir -p Payload
+          cp -R "build/Release-appletvos/AuraTV.app" Payload/
+          zip -r "AuraTV-Unsigned.ipa" Payload
+          rm -rf Payload
+      - name: Upload Unsigned IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: AuraTV-Unsigned-tvOS-IPA
+          path: AuraTV-Unsigned.ipa
