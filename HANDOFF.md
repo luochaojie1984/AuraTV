@@ -747,3 +747,25 @@ public struct RemoteKeyCaptureView: UIViewControllerRepresentable {
 - **已知问题/需要人工配合项**：例如需要用户在 Apple TV 核对配对 PIN 码、提供测试 WebDAV 地址等
 - **下一步计划**：Step X.Z - <下一步名称>
 ```
+
+---
+
+## Phase 2 + Phase 3 完成记录（2026-11-24）
+
+### 已完成
+- **Phase 2**：`project.yml` 接 AMSMB2 4.0.3（API 按 4.0.3 源码逐一对齐）与 KSPlayer 5.6.2；`AMSMB2Provider`（NFC 路径、share 枚举、随机读、取消）、`BonjourDiscoveryService`（NWBrowser + NetService 解析 SMB/WebDAV/WebDAVS）、`KeychainCredentialStore`、`RemoteKeyCaptureView`（220ms 长按判定，非 `.onMoveCommand`）、`MXScrubController`（三段非线性加速 + Latest-Wins）、`AVPlayerEngineAdapter`（VideoToolbox + 近似 seek 实时出画）、`DisplayModeCoordinator`（`AVDisplayCriteria(refreshRate:formatDescription:)`）、`SubtitleOverlayView`。
+- **Phase 3**：`AdaptiveGlassSurface`（tvOS 26/27 原生 Liquid Glass，17 降级）、`TVTheme` + `MarqueeTextView`、`VideoBadgeParser`、`HomeView`、`FileBrowserView`（双栏 + 不截断详情板）、`PlayerScreenView` + `PlayerHUDView` + `SubtitleSettingsDrawer`（9 项实时控件）、`AppSettingsView`。
+- **CI 门禁**：run `45250206866` 双 job 全绿（ubuntu-24.04 Swift 6.0 / xcode-27 Xcode 27.1 tvOS 27.0 SDK），产出 `AuraTV-Unsigned.ipa`（3.35 MB）。流水线内已加硬校验：AMSMB2.framework 必须嵌入、Info.plist 必须有 `NSBonjourServices` 与 `CFBundleShortVersionString`。
+
+### 本轮踩过并修掉的坑（下游务必沿用）
+1. `ubuntu-latest` 已是 26.04，`swift-actions/setup-swift@v2` 不支持 → 改用 `runs-on: ubuntu-24.04` + 预装 Swift。
+2. `NSLock.lock()/unlock()` 在 async 上下文被 Swift 6 判为不可用 → 统一改 `OSAllocatedUnfairLock`。
+3. `INFOPLIST_KEY_NSBonjourServices`（数组）**不会**写进 Info.plist → 必须用 XcodeGen 的 `info.properties` 生成。
+4. SPM 的 dynamic product 需要在依赖上显式 `embed: true`，否则 framework 不进 IPA，真机 dyld 崩溃。
+5. `AVPlayerItemAccessLog` 没有 `lastEvent`，是 `events.last`；`AVDisplayCriteria` 只有 `(refreshRate:formatDescription:)`。
+6. 三个 persistence store 是 `actor`，`AppEnvironment` 必须全 async（`bootstrap()` + `await`）。
+7. tvOS 不支持 `.textSelection` 与带坐标的 `onTapGesture`。
+
+### 未完成 / 需真机
+- Apple TV 配对（atvloadly 网页扫码 + PIN）与真机 9 项验收（Phase 4.2）必须在设备前操作。
+- `KSEngineAdapter`（KSPlayer 主核）尚未接：当前引擎为 AVPlayer/VideoToolbox 实现，KSPlayer 已链接嵌入但未使用。
