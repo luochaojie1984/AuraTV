@@ -100,9 +100,11 @@ struct SourceEditorView: View {
                 HStack(spacing: 16) {
                     Text("协议").font(.system(size: 19)).frame(width: 150, alignment: .leading)
                     Button("SMB") { protocolType = .smb }
-                        .buttonStyle(protocolType == .smb ? .borderedProminent : .bordered)
+                        .buttonStyle(.bordered)
+                        .tint(protocolType == .smb ? TVTheme.accent : .gray)
                     Button("WebDAV") { protocolType = .webdav }
-                        .buttonStyle(protocolType == .webdav ? .borderedProminent : .bordered)
+                        .buttonStyle(.bordered)
+                        .tint(protocolType == .webdav ? TVTheme.accent : .gray)
                 }
 
                 field("主机 / IP", text: $host, placeholder: "192.168.5.229")

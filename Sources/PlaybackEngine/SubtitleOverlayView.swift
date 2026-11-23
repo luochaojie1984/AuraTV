@@ -28,7 +28,7 @@ public struct SubtitleOverlayView: View {
                 VStack {
                     Spacer()
                     Text(text)
-                        .font(.system(size: style.fontSize, weight: style.swiftWeight))
+                        .font(.system(size: style.fontSize, weight: style.fontWeight.swiftWeight))
                         .foregroundStyle(Color(hex: style.textColorHex).opacity(style.textOpacity))
                         .multilineTextAlignment(.center)
                         .lineLimit(4)
