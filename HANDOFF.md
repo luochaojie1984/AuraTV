@@ -316,6 +316,7 @@ services:
     restart: unless-stopped
     security_opt:
       - seccomp:unconfined
+      - apparmor:unconfined
     ports:
       - "5533:80"
     volumes:
