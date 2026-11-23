@@ -32,17 +32,22 @@ targets:
         product: AppPreferences
       - package: AMSMB2
         product: AMSMB2
+        embed: true
       - package: KSPlayer
         product: KSPlayer
+    info:
+      path: Sources/TVApp/Info.plist
+      properties:
+        CFBundleDisplayName: AuraTV
+        CFBundleShortVersionString: "1.0.0"
+        CFBundleVersion: "1"
+        NSLocalNetworkUsageDescription: "用于发现和访问局域网内的 SMB / WebDAV 视频服务器"
+        NSBonjourServices:
+          - "_smb._tcp"
+          - "_webdav._tcp"
+          - "_webdavs._tcp"
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: local.personal.auratv
         SWIFT_VERSION: "6.0"
         TARGETED_DEVICE_FAMILY: "3"
-        GENERATE_INFOPLIST_FILE: YES
-        INFOPLIST_KEY_CFBundleDisplayName: AuraTV
-        INFOPLIST_KEY_NSLocalNetworkUsageDescription: "用于发现和访问局域网内的 SMB / WebDAV 视频服务器"
-        INFOPLIST_KEY_NSBonjourServices:
-          - "_smb._tcp"
-          - "_webdav._tcp"
-          - "_webdavs._tcp"
