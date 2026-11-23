@@ -59,8 +59,8 @@ public struct SubtitleOverlayView: View {
 public extension SubtitleFontWeight {
     var swiftWeight: Font.Weight {
         switch self {
-        case .thin: return .light
         case .regular: return .regular
+        case .medium: return .medium
         case .semibold: return .semibold
         case .bold: return .bold
         }

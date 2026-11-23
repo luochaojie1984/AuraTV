@@ -4,37 +4,43 @@ import LocalStreamProxy
 
 @main
 struct AuraTVApp: App {
-    private let settings = AppSettings()
-    private let proxyInfo = LocalStreamProxyInfo()
+    @StateObject private var env = AppEnvironment.shared
 
     var body: some Scene {
         WindowGroup {
-            ZStack {
-                LinearGradient(
-                    colors: [
-                        Color(red: 0.043, green: 0.055, blue: 0.078),
-                        Color(red: 0.078, green: 0.098, blue: 0.137)
-                    ],
-                    startPoint: .topLeading,
-                    endPoint: .bottomTrailing
-                )
-                .ignoresSafeArea()
+            RootView()
+                .environmentObject(env)
+                .preferredColorScheme(.dark)
+        }
+    }
+}
 
-                VStack(spacing: 28) {
-                    Image(systemName: "play.tv.fill")
-                        .font(.system(size: 84, weight: .semibold))
-                        .foregroundStyle(.white)
+struct RootView: View {
+    @EnvironmentObject private var env: AppEnvironment
+    @State private var selection: RootTab = .home
 
-                    Text("AuraTV Phase 0 Ready")
-                        .font(.system(size: 54, weight: .bold))
-                        .foregroundStyle(.white)
+    enum RootTab: Hashable {
+        case home, sources, settings
+    }
 
-                    Text("MediaCoreKit \(proxyInfo.version) · Cache \(settings.readAheadCacheLimitMB) MB · MX Seek Ready")
-                        .font(.title3)
-                        .foregroundStyle(.white.opacity(0.75))
-                }
-                .padding(60)
+    var body: some View {
+        ZStack {
+            TVTheme.backdrop.ignoresSafeArea()
+
+            TabView(selection: $selection) {
+                HomeView()
+                    .tabItem { Label("首页", systemImage: "house.fill") }
+                    .tag(RootTab.home)
+
+                SourceListView()
+                    .tabItem { Label("网络源", systemImage: "externaldrive.connected.to.line.below") }
+                    .tag(RootTab.sources)
+
+                AppSettingsView()
+                    .tabItem { Label("设置", systemImage: "gearshape.fill") }
+                    .tag(RootTab.settings)
             }
+            .tabViewStyle(.automatic)
         }
     }
 }

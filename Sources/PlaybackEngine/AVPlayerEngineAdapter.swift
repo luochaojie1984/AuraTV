@@ -2,6 +2,7 @@ import Foundation
 import AVFoundation
 import CoreMedia
 import UIKit
+import Combine
 
 /// AVPlayer + VideoToolbox engine core.
 ///
@@ -11,7 +12,7 @@ import UIKit
 /// makes the picture visibly chase the finger at > 6 fps. Releasing the key does
 /// one precise seek and resumes playback.
 @MainActor
-public final class AVPlayerEngineAdapter: NSObject, PlayerEngineProtocol {
+public final class AVPlayerEngineAdapter: NSObject, ObservableObject, PlayerEngineProtocol {
     private let player = AVPlayer()
     private var currentItem: AVPlayerItem?
     private var timeObserver: Any?
@@ -19,9 +20,9 @@ public final class AVPlayerEngineAdapter: NSObject, PlayerEngineProtocol {
     private var readBytes: Int64 = 0
     private var loadStart: Date?
 
-    public private(set) var currentTime: TimeInterval = 0
-    public private(set) var duration: TimeInterval = 0
-    public private(set) var isPlaying: Bool = false
+    @Published public private(set) var currentTime: TimeInterval = 0
+    @Published public private(set) var duration: TimeInterval = 0
+    @Published public private(set) var isPlaying: Bool = false
     public private(set) var playbackRate: Float = 1.0
 
     public var playerLayer: AVPlayerLayer { hostLayer }
