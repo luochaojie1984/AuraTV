@@ -1,4 +1,5 @@
 import Foundation
+import os
 import AMSMB2
 import NetworkVFS
 
@@ -12,9 +13,12 @@ public final class AMSMB2Provider: VFSProvider, @unchecked Sendable {
 
     private let config: MediaSourceConfig
     private let password: String
-    private let stateLock = NSLock()
-    private var manager: SMB2Manager?
-    private var connectedShare: String?
+    private struct ConnectionState {
+        var manager: SMB2Manager?
+        var connectedShare: String?
+    }
+
+    private let stateLock = OSAllocatedUnfairLock<ConnectionState>(initialState: ConnectionState())
 
     public init(config: MediaSourceConfig, password: String) {
         self.config = config
@@ -46,8 +50,7 @@ public final class AMSMB2Provider: VFSProvider, @unchecked Sendable {
     }
 
     private func currentManager() throws -> SMB2Manager {
-        stateLock.lock()
-        defer { stateLock.unlock() }
+        let manager = stateLock.withLock { $0.manager }
         guard let manager else { throw VFSError.notConnected }
         return manager
     }
@@ -66,10 +69,10 @@ public final class AMSMB2Provider: VFSProvider, @unchecked Sendable {
         guard let newManager = SMB2Manager(url: url, domain: "", credential: credential) else {
             throw VFSError.invalidURL(urlString)
         }
-        stateLock.lock()
-        manager = newManager
-        connectedShare = nil
-        stateLock.unlock()
+        stateLock.withLock {
+            $0.manager = newManager
+            $0.connectedShare = nil
+        }
 
         if let share = shareName {
             try await connectShare(share, using: newManager)
@@ -82,17 +85,16 @@ public final class AMSMB2Provider: VFSProvider, @unchecked Sendable {
         } catch {
             throw VFSError.ioFailure("connectShare(\(share)) failed: \(error.localizedDescription)")
         }
-        stateLock.lock()
-        connectedShare = share
-        stateLock.unlock()
+        stateLock.withLock { $0.connectedShare = share }
     }
 
     public func disconnect() async {
-        stateLock.lock()
-        let manager = self.manager
-        self.manager = nil
-        self.connectedShare = nil
-        stateLock.unlock()
+        let manager = stateLock.withLock { state -> SMB2Manager? in
+            let current = state.manager
+            state.manager = nil
+            state.connectedShare = nil
+            return current
+        }
         try? await manager?.disconnectShare()
     }
 
@@ -227,18 +229,9 @@ public final class AMSMB2RandomAccessStream: VFSRandomAccessStream, @unchecked S
 
 /// Minimal atomic flag so the stream stays Sendable without importing Atomics.
 final class ManagedAtomicFlag: @unchecked Sendable {
-    private let lock = NSLock()
-    private var value = false
+    private let lock = OSAllocatedUnfairLock<Bool>(initialState: false)
 
-    var isSet: Bool {
-        lock.lock()
-        defer { lock.unlock() }
-        return value
-    }
+    var isSet: Bool { lock.withLock { $0 } }
 
-    func set() {
-        lock.lock()
-        value = true
-        lock.unlock()
-    }
+    func set() { lock.withLock { $0 = true } }
 }

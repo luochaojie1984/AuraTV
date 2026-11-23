@@ -23,6 +23,8 @@ public final class AVPlayerEngineAdapter: NSObject, ObservableObject, PlayerEngi
     @Published public private(set) var currentTime: TimeInterval = 0
     @Published public private(set) var duration: TimeInterval = 0
     @Published public private(set) var isPlaying: Bool = false
+    /// Kept so `AVDisplayCriteria` can be built with the real format description.
+    public private(set) var videoFormatDescription: CMFormatDescription?
     public private(set) var playbackRate: Float = 1.0
 
     public var playerLayer: AVPlayerLayer { hostLayer }
@@ -66,6 +68,7 @@ public final class AVPlayerEngineAdapter: NSObject, ObservableObject, PlayerEngi
         self.loadedDuration = duration
 
         if let info = await Self.probeTechnicalInfo(asset: asset) {
+            videoFormatDescription = info.formatDescription
             stats = PlaybackStats(
                 videoCodec: info.codec,
                 resolution: "\(info.width)x\(info.height)",
@@ -87,6 +90,7 @@ public final class AVPlayerEngineAdapter: NSObject, ObservableObject, PlayerEngi
         var height: Int
         var frameRate: Double
         var dynamicRange: String
+        var formatDescription: CMFormatDescription?
     }
 
     static func probeTechnicalInfo(asset: AVURLAsset) async -> ProbeResult? {
@@ -115,7 +119,8 @@ public final class AVPlayerEngineAdapter: NSObject, ObservableObject, PlayerEngi
                 width: Int(size.width),
                 height: Int(size.height),
                 frameRate: Double(rate),
-                dynamicRange: dynamicRange
+                dynamicRange: dynamicRange,
+                formatDescription: formats.first
             )
         } catch {
             return nil
@@ -176,7 +181,7 @@ public final class AVPlayerEngineAdapter: NSObject, ObservableObject, PlayerEngi
         var snapshot = stats
         if let item = currentItem {
             let accessLog = item.accessLog()
-            if let last = accessLog?.lastEvent {
+            if let last = accessLog?.events.last {
                 snapshot.droppedFrames = Int(last.numberOfDroppedVideoFrames)
                 snapshot.readMbps = last.transferDuration > 0
                     ? (Double(last.numberOfBytesTransferred) * 8.0 / 1_000_000.0) / last.transferDuration

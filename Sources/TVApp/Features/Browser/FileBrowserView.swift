@@ -216,7 +216,6 @@ struct FileBrowserView: View {
                 Text(focused.path)
                     .font(.system(size: 16))
                     .foregroundStyle(TVTheme.tertiaryText)
-                    .textSelection(.enabled)
                 if !focused.isDirectory {
                     Text("大小：\(ByteCountFormatter.string(fromByteCount: focused.size, countStyle: .file))")
                         .font(.system(size: 18))

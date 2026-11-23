@@ -36,10 +36,8 @@ struct HomeView: View {
             .padding(.horizontal, TVMetrics.horizontalSafeMargin)
             .padding(.vertical, TVMetrics.verticalSafeMargin)
         }
-        .onAppear {
-            env.reload()
-            discovery.start()
-        }
+        .onAppear { discovery.start() }
+        .task { await env.reload() }
         .onDisappear { discovery.stop() }
         .fullScreenCover(item: $browserTarget) { target in
             FileBrowserView(target: target, onPlay: { request in
@@ -160,7 +158,7 @@ struct HomeView: View {
             useTLS: host.protocolType == "webdav" && host.port == 443,
             basePath: "/"
         )
-        try? env.upsert(source: config, password: nil)
+        Task { try? await env.upsert(source: config, password: nil) }
     }
 
     private func replay(_ record: PlaybackHistoryRecord) {

@@ -18,7 +18,7 @@ struct AppSettingsView: View {
                         selectedIndex: [5.0, 10.0, 15.0, 30.0].firstIndex(of: env.settings.shortSeekSeconds) ?? 1
                     ) { index in
                         let values: [Double] = [5, 10, 15, 30]
-                        env.updateSettings { $0.shortSeekSeconds = values[index] }
+                        Task { await env.updateSettings { $0.shortSeekSeconds = values[index] } }
                     }
 
                     optionRow(
@@ -26,8 +26,10 @@ struct AppSettingsView: View {
                         options: ["MX 实时跳帧", "连续倍速"],
                         selectedIndex: env.settings.longPressSeekMode == .mxLiveKeyframeScrub ? 0 : 1
                     ) { index in
-                        env.updateSettings {
-                            $0.longPressSeekMode = index == 0 ? .mxLiveKeyframeScrub : .continuousFastPlay
+                        Task {
+                            await env.updateSettings {
+                                $0.longPressSeekMode = index == 0 ? .mxLiveKeyframeScrub : .continuousFastPlay
+                            }
                         }
                     }
                 }
@@ -39,7 +41,7 @@ struct AppSettingsView: View {
                         selectedIndex: [64, 96, 128, 160, 192].firstIndex(of: env.settings.readAheadCacheLimitMB) ?? 1
                     ) { index in
                         let values = [64, 96, 128, 160, 192]
-                        env.updateSettings { $0.readAheadCacheLimitMB = values[index] }
+                        Task { await env.updateSettings { $0.readAheadCacheLimitMB = values[index] } }
                     }
                     Text("Apple TV 内存上限硬约束 192 MB，超出会被系统 Jetsam 杀掉。")
                         .font(.system(size: 16))

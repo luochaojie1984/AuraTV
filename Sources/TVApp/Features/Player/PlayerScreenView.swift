@@ -122,7 +122,7 @@ struct PlayerScreenView: View {
                         subtitleName: subtitleTrack.map { "\($0.format.uppercased()) · \($0.cues.count) 条" },
                         hasSubtitle: subtitleTrack != nil,
                         onStyleChange: { mutate in
-                            env.updateSubtitleStyle(mutate)
+                            Task { await env.updateSubtitleStyle(mutate) }
                         },
                         onClose: {
                             showSubtitleDrawer = false
@@ -244,12 +244,8 @@ struct PlayerScreenView: View {
             )
             try await engine.load(url: registered.url, startAt: request.resumeAt)
             DisplayModeCoordinator.shared.apply(
-                info: MediaTechnicalInfo(
-                    frameRate: engine.currentStats().frameRate,
-                    dynamicRange: engine.currentStats().dynamicRange,
-                    width: 0,
-                    height: 0
-                )
+                refreshRate: Float(engine.currentStats().frameRate),
+                formatDescription: engine.videoFormatDescription
             )
             scheduleHUDHide()
             await loadSubtitles(provider: newProvider)
@@ -362,7 +358,7 @@ struct PlayerScreenView: View {
             selectedSubtitlePath: nil,
             selectedAudioTrackID: nil
         )
-        env.recordProgress(record)
+        Task { await env.recordProgress(record) }
     }
 
     private func shutdown() {

@@ -45,7 +45,7 @@ struct SourceListView: View {
                             Button("测速") { speedTestSource = source }
                                 .buttonStyle(.bordered)
                             Button("删除", role: .destructive) {
-                                try? env.delete(source: source)
+                                Task { try? await env.delete(source: source) }
                             }
                             .buttonStyle(.bordered)
                         }
@@ -174,11 +174,13 @@ struct SourceEditorView: View {
             username: username,
             credentialKey: existing?.credentialKey ?? ""
         )
-        do {
-            try env.upsert(source: config, password: password.isEmpty ? nil : password)
-            dismiss()
-        } catch {
-            errorText = error.localizedDescription
+        Task {
+            do {
+                try await env.upsert(source: config, password: password.isEmpty ? nil : password)
+                dismiss()
+            } catch {
+                errorText = error.localizedDescription
+            }
         }
     }
 }

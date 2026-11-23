@@ -50,22 +50,33 @@ struct PlayerHUDView: View {
                 .buttonStyle(.bordered)
             }
 
-            GeometryReader { proxy in
-                ZStack(alignment: .leading) {
-                    Capsule().fill(Color.white.opacity(0.18))
-                    Capsule()
-                        .fill(TVTheme.accent)
-                        .frame(width: max(0, proxy.size.width * progress))
+            HStack(spacing: 14) {
+                Button {
+                    onSeek(max(0, engine.currentTime - settings.shortSeekSeconds))
+                } label: {
+                    Image(systemName: "gobackward.10")
+                }
+                .buttonStyle(.plain)
+                .disabled(engine.duration <= 0)
+
+                GeometryReader { proxy in
+                    ZStack(alignment: .leading) {
+                        Capsule().fill(Color.white.opacity(0.18))
+                        Capsule()
+                            .fill(TVTheme.accent)
+                            .frame(width: max(0, proxy.size.width * progress))
+                    }
                 }
                 .frame(height: 8)
-                .contentShape(Rectangle())
-                .onTapGesture { location in
-                    guard engine.duration > 0 else { return }
-                    let ratio = min(max(location.x / proxy.size.width, 0), 1)
-                    onSeek(ratio * engine.duration)
+
+                Button {
+                    onSeek(min(engine.duration, engine.currentTime + settings.shortSeekSeconds))
+                } label: {
+                    Image(systemName: "goforward.10")
                 }
+                .buttonStyle(.plain)
+                .disabled(engine.duration <= 0)
             }
-            .frame(height: 8)
         }
         .padding(.horizontal, 26)
         .padding(.vertical, 20)

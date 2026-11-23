@@ -11,6 +11,7 @@ struct AuraTVApp: App {
             RootView()
                 .environmentObject(env)
                 .preferredColorScheme(.dark)
+                .task { await env.bootstrap() }
         }
     }
 }

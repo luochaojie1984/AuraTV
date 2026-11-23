@@ -6,6 +6,8 @@ import LocalStreamProxy
 import AppPreferences
 
 /// Single observable source of truth for the whole app.
+/// The three persistence stores are Swift actors, so every access is `await`ed
+/// and published state is refreshed on the main actor.
 @MainActor
 public final class AppEnvironment: ObservableObject {
     public static let shared = AppEnvironment()
@@ -15,18 +17,18 @@ public final class AppEnvironment: ObservableObject {
     public let historyStore: PlaybackHistoryStore
     public let proxy = LocalHTTPStreamProxy()
 
-    @Published public private(set) var settings: AppSettings
+    @Published public private(set) var settings = AppSettings()
     @Published public private(set) var sources: [MediaSourceConfig] = []
     @Published public private(set) var continueWatching: [PlaybackHistoryRecord] = []
     @Published public var proxyError: String?
+
+    private var bootstrapped = false
 
     private init() {
         let directory = Self.storageDirectory()
         settingsStore = AppSettingsStore(storageDirectory: directory)
         sourceStore = MediaSourceStore(storageDirectory: directory)
         historyStore = PlaybackHistoryStore(storageDirectory: directory)
-        settings = (try? settingsStore.load()) ?? AppSettings()
-        reload()
         do {
             try proxy.start()
         } catch {
@@ -42,49 +44,58 @@ public final class AppEnvironment: ObservableObject {
         return dir
     }
 
-    public func reload() {
-        sources = (try? sourceStore.allSources()) ?? []
-        continueWatching = (try? historyStore.continueWatching(limit: 20)) ?? []
-        settings = (try? settingsStore.load()) ?? settings
+    /// Loads persisted state once, after the first view appears.
+    public func bootstrap() async {
+        guard !bootstrapped else { return }
+        bootstrapped = true
+        await reload()
     }
 
-    public func upsert(source: MediaSourceConfig, password: String?) throws {
-        try sourceStore.upsert(source)
+    public func reload() async {
+        sources = (try? await sourceStore.allSources()) ?? []
+        continueWatching = (try? await historyStore.continueWatching(limit: 20)) ?? []
+        if let loaded = try? await settingsStore.load() {
+            settings = loaded
+        }
+    }
+
+    public func upsert(source: MediaSourceConfig, password: String?) async throws {
+        try await sourceStore.upsert(source)
         if let password, !password.isEmpty {
             try KeychainCredentialStore.savePassword(password, forKey: source.credentialKey)
         }
-        reload()
+        await reload()
     }
 
-    public func delete(source: MediaSourceConfig) throws {
-        try sourceStore.delete(id: source.id)
+    public func delete(source: MediaSourceConfig) async throws {
+        try await sourceStore.delete(id: source.id)
         KeychainCredentialStore.deletePassword(forKey: source.credentialKey)
-        reload()
+        await reload()
     }
 
-    public func updateSettings(_ mutate: (inout AppSettings) -> Void) {
+    public func updateSettings(_ mutate: @Sendable (inout AppSettings) -> Void) async {
         var next = settings
         mutate(&next)
         do {
-            try settingsStore.save(next)
+            try await settingsStore.save(next)
             settings = next
         } catch {
             proxyError = "设置保存失败：\(error.localizedDescription)"
         }
     }
 
-    public func updateSubtitleStyle(_ mutate: @Sendable (inout SubtitleStyleConfig) -> Void) {
+    public func updateSubtitleStyle(_ mutate: @Sendable (inout SubtitleStyleConfig) -> Void) async {
         do {
-            let updated = try settingsStore.updateSubtitleStyle(mutate)
+            let updated = try await settingsStore.updateSubtitleStyle(mutate)
             settings.subtitleStyle = updated
         } catch {
             proxyError = "字幕样式保存失败：\(error.localizedDescription)"
         }
     }
 
-    public func recordProgress(_ record: PlaybackHistoryRecord) {
-        try? historyStore.recordProgress(record)
-        continueWatching = (try? historyStore.continueWatching(limit: 20)) ?? continueWatching
+    public func recordProgress(_ record: PlaybackHistoryRecord) async {
+        try? await historyStore.recordProgress(record)
+        continueWatching = (try? await historyStore.continueWatching(limit: 20)) ?? continueWatching
     }
 
     /// Builds the right provider for a saved source.
