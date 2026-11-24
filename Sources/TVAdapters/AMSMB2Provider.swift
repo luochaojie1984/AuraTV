@@ -99,10 +99,10 @@ public final class AMSMB2Provider: VFSProvider, @unchecked Sendable {
     }
 
     private final class TCPPreflightCoordinator: @unchecked Sendable {
-        private struct State {
+        private struct State: Sendable {
             var finished = false
             var lastWaitingMessage: String?
-            var timeoutItem: DispatchWorkItem?
+            var timeoutTask: Task<Void, Never>?
         }
 
         private let lock = OSAllocatedUnfairLock<State>(initialState: State())
@@ -117,41 +117,46 @@ public final class AMSMB2Provider: VFSProvider, @unchecked Sendable {
             self.connection = NWConnection(host: NWEndpoint.Host(host), port: nwPort, using: .tcp)
         }
 
+        private func finish(
+            _ continuation: CheckedContinuation<Void, any Error>,
+            result: Result<Void, any Error>
+        ) {
+            let (shouldResume, taskToCancel) = lock.withLock { state -> (Bool, Task<Void, Never>?) in
+                guard !state.finished else { return (false, nil) }
+                state.finished = true
+                let t = state.timeoutTask
+                state.timeoutTask = nil
+                return (true, t)
+            }
+            guard shouldResume else { return }
+            taskToCancel?.cancel()
+            connection.stateUpdateHandler = nil
+            connection.cancel()
+            continuation.resume(with: result)
+        }
+
         func run(timeoutSeconds: TimeInterval) async throws {
+            let timeoutNanos = UInt64(max(0.5, timeoutSeconds) * 1_000_000_000)
             try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, any Error>) in
-                let work = DispatchWorkItem { [weak self] in
-                    guard let self else { return }
-                    let waitingMsg: String? = self.lock.withLock { state in
-                        guard !state.finished else { return nil }
-                        state.finished = true
-                        state.timeoutItem = nil
-                        return state.lastWaitingMessage ?? ""
+                let timeoutTask = Task {
+                    try? await Task.sleep(nanoseconds: timeoutNanos)
+                    guard !Task.isCancelled else { return }
+                    let waitingMsg = self.lock.withLock { $0.lastWaitingMessage }
+                    let message: String
+                    if let waitingMsg, !waitingMsg.isEmpty {
+                        message = waitingMsg
+                    } else {
+                        message = "连接 \(self.host):\(self.port) 超时，请检查 IP 地址、端口及局域网连通性（以及 Apple TV「设置 → 隐私与安全性 → 本地网络」中 AuraTV 权限）"
                     }
-                    guard let waitingMsg else { return }
-                    self.connection.cancel()
-                    let message = waitingMsg.isEmpty
-                        ? "连接 \(self.host):\(self.port) 超时，请检查 IP 地址、端口及局域网连通性（以及 Apple TV「设置 → 隐私与安全性 → 本地网络」中 AuraTV 权限）"
-                        : waitingMsg
-                    continuation.resume(throwing: VFSError.ioFailure(message))
+                    self.finish(continuation, result: .failure(VFSError.ioFailure(message)))
                 }
 
-                self.lock.withLock { $0.timeoutItem = work }
+                self.lock.withLock { $0.timeoutTask = timeoutTask }
 
-                self.connection.stateUpdateHandler = { [weak self] nwState in
-                    guard let self else { return }
+                self.connection.stateUpdateHandler = { nwState in
                     switch nwState {
                     case .ready:
-                        let (shouldResume, itemToCancel) = self.lock.withLock { state -> (Bool, DispatchWorkItem?) in
-                            guard !state.finished else { return (false, nil) }
-                            state.finished = true
-                            let item = state.timeoutItem
-                            state.timeoutItem = nil
-                            return (true, item)
-                        }
-                        guard shouldResume else { return }
-                        itemToCancel?.cancel()
-                        self.connection.cancel()
-                        continuation.resume()
+                        self.finish(continuation, result: .success(()))
 
                     case .waiting(let nwError):
                         let msg = AMSMB2Provider.describeNWError(nwError, host: self.host, port: self.port)
@@ -162,38 +167,17 @@ public final class AMSMB2Provider: VFSProvider, @unchecked Sendable {
                         }
 
                     case .failed(let nwError):
-                        let (shouldResume, itemToCancel) = self.lock.withLock { state -> (Bool, DispatchWorkItem?) in
-                            guard !state.finished else { return (false, nil) }
-                            state.finished = true
-                            let item = state.timeoutItem
-                            state.timeoutItem = nil
-                            return (true, item)
-                        }
-                        guard shouldResume else { return }
-                        itemToCancel?.cancel()
-                        self.connection.cancel()
                         let msg = AMSMB2Provider.describeNWError(nwError, host: self.host, port: self.port)
-                        continuation.resume(throwing: VFSError.ioFailure(msg))
+                        self.finish(continuation, result: .failure(VFSError.ioFailure(msg)))
 
                     case .cancelled:
-                        let (shouldResume, itemToCancel) = self.lock.withLock { state -> (Bool, DispatchWorkItem?) in
-                            guard !state.finished else { return (false, nil) }
-                            state.finished = true
-                            let item = state.timeoutItem
-                            state.timeoutItem = nil
-                            return (true, item)
-                        }
-                        if shouldResume {
-                            itemToCancel?.cancel()
-                            continuation.resume(throwing: VFSError.cancelled)
-                        }
+                        self.finish(continuation, result: .failure(VFSError.cancelled))
 
                     default:
                         break
                     }
                 }
 
-                self.queue.asyncAfter(deadline: .now() + timeoutSeconds, execute: work)
                 self.connection.start(queue: self.queue)
             }
         }
