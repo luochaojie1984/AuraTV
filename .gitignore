@@ -10,3 +10,4 @@ DerivedData/
 .env
 *.p12
 *.mobileprovision
+dist/

@@ -21,6 +21,7 @@ struct HomeView: View {
     @State private var browserTarget: BrowserTarget?
     @State private var playbackRequest: PlaybackRequest?
     @State private var isAddingSource = false
+    @State private var pendingOpenSource: MediaSourceConfig?
 
     private var unaddedDiscoveredHosts: [DiscoveredLANHost] {
         discovery.discoveredHosts.filter { !env.isDiscoveredHostRemembered($0) }
@@ -60,8 +61,15 @@ struct HomeView: View {
         .onAppear { discovery.start() }
         .task { await env.reload() }
         .onDisappear { discovery.stop() }
-        .sheet(isPresented: $isAddingSource) {
-            SourceEditorView(existing: nil)
+        .sheet(isPresented: $isAddingSource, onDismiss: {
+            if let source = pendingOpenSource {
+                pendingOpenSource = nil
+                browserTarget = BrowserTarget(source: source)
+            }
+        }) {
+            SourceEditorView(existing: nil) { saved in
+                pendingOpenSource = saved
+            }
         }
         .fullScreenCover(item: $browserTarget) { target in
             FileBrowserView(target: target)

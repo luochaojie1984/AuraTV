@@ -23,8 +23,8 @@ final class AppPreferencesStoresTests: XCTestCase {
         let smb = MediaSourceConfig(
             displayName: "Home NAS",
             protocolType: .smb,
-            host: "192.168.5.229",
-            basePath: "/AV",
+            host: "192.168.1.10",
+            basePath: "/Movies",
             username: "guest"
         )
         try await store.upsert(smb)
@@ -34,7 +34,7 @@ final class AppPreferencesStoresTests: XCTestCase {
         let loaded = try await reloaded.allSources()
         XCTAssertEqual(loaded.count, 1)
         XCTAssertEqual(loaded[0].displayName, "Home NAS")
-        XCTAssertEqual(loaded[0].host, "192.168.5.229")
+        XCTAssertEqual(loaded[0].host, "192.168.1.10")
 
         try await reloaded.delete(id: smb.id)
         let remaining = try await reloaded.allSources(); XCTAssertTrue(remaining.isEmpty)

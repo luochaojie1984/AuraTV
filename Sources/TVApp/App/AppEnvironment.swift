@@ -24,11 +24,17 @@ public final class AppEnvironment: ObservableObject {
     @Published public private(set) var connectedSourceIDs: Set<UUID> = []
     @Published public var proxyError: String?
 
+    private let storageDirectoryURL: URL
+    private static let persistedFileNames = ["sources.json", "app_settings.json", "playback_history.json"]
+    private static let userDefaultsBackupPrefix = "local.personal.auratv.backup."
+
     private var providerPool: [UUID: any VFSProvider] = [:]
     private var bootstrapped = false
 
     private init() {
         let directory = Self.storageDirectory()
+        Self.restoreMirroredFilesIfNeeded(into: directory)
+        self.storageDirectoryURL = directory
         settingsStore = AppSettingsStore(storageDirectory: directory)
         sourceStore = MediaSourceStore(storageDirectory: directory)
         historyStore = PlaybackHistoryStore(storageDirectory: directory)
@@ -40,11 +46,35 @@ public final class AppEnvironment: ObservableObject {
     }
 
     public static func storageDirectory() -> URL {
-        let base = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first
+        // Real tvOS makes .documentDirectory strictly read-only; persist in Caches and mirror to UserDefaults.
+        let base = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first
             ?? FileManager.default.temporaryDirectory
         let dir = base.appendingPathComponent("AuraTV", isDirectory: true)
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         return dir
+    }
+
+    private static func restoreMirroredFilesIfNeeded(into directory: URL) {
+        let fm = FileManager.default
+        let defaults = UserDefaults.standard
+        for fileName in persistedFileNames {
+            let fileURL = directory.appendingPathComponent(fileName)
+            guard !fm.fileExists(atPath: fileURL.path),
+                  let data = defaults.data(forKey: userDefaultsBackupPrefix + fileName) else {
+                continue
+            }
+            try? fm.createDirectory(at: directory, withIntermediateDirectories: true)
+            try? data.write(to: fileURL, options: .atomic)
+        }
+    }
+
+    private func mirrorFileToUserDefaults(named fileName: String) {
+        let fileURL = storageDirectoryURL.appendingPathComponent(fileName)
+        guard let data = try? Data(contentsOf: fileURL),
+              data.count <= 400_000 else {
+            return
+        }
+        UserDefaults.standard.set(data, forKey: Self.userDefaultsBackupPrefix + fileName)
     }
 
     /// Loads persisted state once and silently pre-connects remembered LAN sources in background.
@@ -73,17 +103,18 @@ public final class AppEnvironment: ObservableObject {
 
     public func upsert(source: MediaSourceConfig, password: String?) async throws {
         try await sourceStore.upsert(source)
+        mirrorFileToUserDefaults(named: "sources.json")
         if let password, !password.isEmpty {
             try KeychainCredentialStore.savePassword(password, forKey: source.credentialKey)
         }
         await invalidateCachedProvider(for: source.id)
         await reload()
-        Task { _ = try? await self.connectedProvider(for: source) }
     }
 
     public func delete(source: MediaSourceConfig) async throws {
         await invalidateCachedProvider(for: source.id)
         try await sourceStore.delete(id: source.id)
+        mirrorFileToUserDefaults(named: "sources.json")
         KeychainCredentialStore.deletePassword(forKey: source.credentialKey)
         await updateSettings { $0.lastVisitedPaths.removeValue(forKey: source.id.uuidString) }
         await reload()
@@ -108,6 +139,7 @@ public final class AppEnvironment: ObservableObject {
             basePath: "/"
         )
         try? await sourceStore.upsert(config)
+        mirrorFileToUserDefaults(named: "sources.json")
         await reload()
         return config
     }
@@ -123,6 +155,7 @@ public final class AppEnvironment: ObservableObject {
         mutate(&next)
         do {
             try await settingsStore.save(next)
+            mirrorFileToUserDefaults(named: "app_settings.json")
             settings = next
             UISoundPlayer.shared.isEnabled = next.enableUISoundEffects
         } catch {
@@ -133,6 +166,7 @@ public final class AppEnvironment: ObservableObject {
     public func updateSubtitleStyle(_ mutate: @Sendable (inout SubtitleStyleConfig) -> Void) async {
         do {
             let updated = try await settingsStore.updateSubtitleStyle(mutate)
+            mirrorFileToUserDefaults(named: "app_settings.json")
             settings.subtitleStyle = updated
         } catch {
             proxyError = "字幕样式保存失败：\(error.localizedDescription)"
@@ -158,6 +192,7 @@ public final class AppEnvironment: ObservableObject {
     public func recordProgress(_ record: PlaybackHistoryRecord) async {
         guard settings.enableResumePlayback else { return }
         try? await historyStore.recordProgress(record)
+        mirrorFileToUserDefaults(named: "playback_history.json")
         historyByKey[record.id] = record
         continueWatching = (try? await historyStore.continueWatching(limit: 20)) ?? continueWatching
     }
@@ -178,6 +213,7 @@ public final class AppEnvironment: ObservableObject {
 
     public func clearPlaybackHistory() async {
         try? await historyStore.clearAll()
+        mirrorFileToUserDefaults(named: "playback_history.json")
         historyByKey.removeAll()
         continueWatching.removeAll()
     }

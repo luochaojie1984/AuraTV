@@ -6,10 +6,10 @@ import NetworkVFS
 /// SMB2/SMB3 provider backed by AMSMB2 (libsmb2).
 ///
 /// Supports all 3 source configurations cleanly:
-/// 1. `basePath == "/"` (e.g. Bonjour auto-discovered host): root lists shares (`/AV`, `/Movies`);
-///    navigating into `/AV/...` dynamically connects share `AV` and strips the `/AV` prefix.
-/// 2. `basePath == "/AV"`: connects share `AV` upfront; browsing `/` lists share root.
-/// 3. `basePath == "/AV/Movies"`: connects share `AV` upfront and roots browsing at `/Movies`.
+/// 1. `basePath == "/"` (e.g. Bonjour auto-discovered host): root lists shares (`/Movies`, `/Series`);
+///    navigating into `/Movies/...` dynamically connects share `Movies` and strips the `/Movies` prefix.
+/// 2. `basePath == "/Movies"`: connects share `Movies` upfront; browsing `/` lists share root.
+/// 3. `basePath == "/Media/Movies"`: connects share `Media` upfront and roots browsing at `/Movies`.
 public final class AMSMB2Provider: VFSProvider, @unchecked Sendable {
     public let scheme = "smb"
 
@@ -39,7 +39,7 @@ public final class AMSMB2Provider: VFSProvider, @unchecked Sendable {
         configuredBaseParts.first
     }
 
-    /// Subpath inside the configured share (e.g. `"/Movies"` when `basePath == "/AV/Movies"`), or `""`.
+    /// Subpath inside the configured share (e.g. `"/Movies"` when `basePath == "/Media/Movies"`), or `""`.
     private var configuredShareSubpath: String {
         let parts = configuredBaseParts
         guard parts.count > 1 else { return "" }
@@ -57,16 +57,39 @@ public final class AMSMB2Provider: VFSProvider, @unchecked Sendable {
     }
 
     public func connect() async throws {
-        let portSuffix = config.port.map { ":\($0)" } ?? ""
-        let urlString = "smb://\(config.host)\(portSuffix)"
+        var cleanHost = config.host.trimmingCharacters(in: .whitespacesAndNewlines)
+        if cleanHost.lowercased().hasPrefix("smb://") {
+            cleanHost = String(cleanHost.dropFirst("smb://".count))
+        }
+        while cleanHost.hasSuffix("/") {
+            cleanHost.removeLast()
+        }
+        if !cleanHost.hasPrefix("[") && cleanHost.contains(":") {
+            cleanHost = "[\(cleanHost)]"
+        }
+
+        let portSuffix = config.port.flatMap { $0 == 445 ? nil : ":\($0)" } ?? ""
+        let urlString = "smb://\(cleanHost)\(portSuffix)"
         guard let url = URL(string: urlString) else {
             throw VFSError.invalidURL(urlString)
         }
-        let credential: URLCredential? = config.username.isEmpty
-            ? nil
-            : URLCredential(user: config.username, password: password, persistence: .forSession)
 
-        guard let newManager = SMB2Manager(url: url, domain: "", credential: credential) else {
+        let rawUser = config.username.trimmingCharacters(in: .whitespacesAndNewlines)
+        let domain: String
+        let username: String
+        if let slashIndex = rawUser.firstIndex(of: "\\") {
+            domain = String(rawUser[..<slashIndex])
+            username = String(rawUser[rawUser.index(after: slashIndex)...])
+        } else {
+            domain = ""
+            username = rawUser
+        }
+
+        let credential: URLCredential? = username.isEmpty
+            ? nil
+            : URLCredential(user: username, password: password, persistence: .forSession)
+
+        guard let newManager = SMB2Manager(url: url, domain: domain, credential: credential) else {
             throw VFSError.invalidURL(urlString)
         }
         stateLock.withLock {

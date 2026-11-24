@@ -6,7 +6,7 @@
 
 ## 一、获取编译好的安装包（`AuraTV-Unsigned.ipa`）
 
-1. 在 `192.168.5.157` 上将代码推送到你的 GitHub 仓库（公开或私有仓库均可）：
+1. 在 `<Linux构建机>` 上将代码推送到你的 GitHub 仓库（公开或私有仓库均可）：
    ```bash
    cd /data/projects/AuraTV
    git remote add origin <你的GitHub仓库URL>
@@ -25,8 +25,8 @@
 
 免费 Apple ID 签名的 App 每 **7 天** 会过期一次，通过 **`atvloadly`** 可在局域网后台**每 7 天全自动无感续签**，实现接近永久有效：
 
-### 方案 A：直接使用已部署好的 `192.168.5.157`（现在就能用！）
-- 服务已部署并启动完毕，浏览器直接访问：**`http://192.168.5.157:5533`**。
+### 方案 A：在任意 Linux / NAS 上用 Docker 启动 `atvloadly`
+- 启动容器后浏览器访问：**`http://<服务器局域网IP>:5533`**。
 
 ### 方案 B：部署到 24 小时不关机的 OpenWrt 路由器（推荐长期使用）
 - 确认你的 OpenWrt 为 `x86_64` 或 `arm64` 架构、已装 Docker 且有 ≥ 300MB 持久化目录（例如 `/mnt/data`）。
@@ -35,20 +35,20 @@
   sh openwrt-atvloadly.sh /mnt/data/atvloadly
   ```
 - 部署完成后访问：**`http://<OpenWrt局域网IP>:5533`**。
-- *无损迁移提示*：如果你先在 `192.168.5.157` 配对好了，以后想迁到 OpenWrt，停掉旧容器并把 `/data/atvloadly` 整个目录拷贝到 OpenWrt 的 `/mnt/data/atvloadly` 启动即可，无需重新配对！
+- *无损迁移提示*：如果你先在 `<Linux构建机>` 配对好了，以后想迁到 OpenWrt，停掉旧容器并把 `/data/atvloadly` 整个目录拷贝到 OpenWrt 的 `/mnt/data/atvloadly` 启动即可，无需重新配对！
 
 ---
 
 ## 三、无线配对 Apple TV 4K 并一键安装（约 2 分钟）
 
-> **前提检查**：确保 Apple TV 4K 与 `atvloadly` 所在设备处于**同一个局域网网段**（例如都在 `192.168.5.x`），路由器未开启 AP 隔离。
+> **前提检查**：确保 Apple TV 4K 与 `atvloadly` 所在设备处于**同一个局域网网段**（例如都在 `192.168.1.x`），路由器未开启 AP 隔离。
 
 1. **打开 Apple TV 进入配对界面**：
    - 拿起 Siri Remote，在 Apple TV 上依次进入：
      **设置（Settings） -> 遥控器与设备（Remotes and Devices） -> 遥控器 App 与设备（Remote App and Devices）**
    - 保持停留在当前页面（不要退出）。
 2. **在网页端配对 Apple TV**：
-   - 电脑浏览器打开 **`http://192.168.5.157:5533`**（或你的 OpenWrt 地址）；
+   - 电脑浏览器打开 **`http://<服务器局域网IP>:5533`**（或你的 OpenWrt 地址）；
    - 点击 **添加/扫描设备（Pair / Devices）**，页面会自动通过 Avahi mDNS 发现你的 Apple TV 4K；
    - 点击配对 -> 电视屏幕上会弹出 **4 位或 6 位配对 PIN 码** -> 在网页输入该 PIN 码，提示配对成功。
 3. **添加免费 Apple ID**：

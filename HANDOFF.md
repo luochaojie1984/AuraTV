@@ -25,10 +25,10 @@
 
 | 项目 | 真实配置 | 角色与注意事项 |
 | :--- | :--- | :--- |
-| **主力开发机** | Ubuntu 24.04.5 LTS (`192.168.5.157`, 用户 `lcj`) | AMD EPYC 48 线程 / 125GB 内存 / Docker 运行中。**源码必须放在 `/data/projects/AuraTV`**（`/data` 余 529G；不要把大文件塞在 `/`） |
-| **局域网 SMB 测试环境** | `192.168.5.0/24` 同网段（已有 SMB 服务） | 仅作只读测试，**严禁删除、修改或写入用户任何现有媒体文件** |
+| **主力开发机** | Ubuntu 24.04.5 LTS (`<dev-host>`, 用户 `<user>`) | AMD EPYC 48 线程 / 125GB 内存 / Docker 运行中。**源码必须放在 `/data/projects/AuraTV`**（`/data` 余 529G；不要把大文件塞在 `/`） |
+| **局域网 SMB 测试环境** | `192.168.1.0/24` 同网段（已有 SMB 服务） | 仅作只读测试，**严禁删除、修改或写入用户任何现有媒体文件** |
 | **tvOS 编译机** | GitHub Actions (`xcode-27` Apple Silicon) | 每次 `git push` 自动用 **Xcode 27 + tvOS 27 SDK** 生成 `AuraTV-Unsigned.ipa`，并可按需自动运行 tvOS 27 无头模拟器导出 UI 预览截图供 Windows 浏览器查看 |
-| **无线安装与自动续签** | OpenWrt 不关机路由器（Docker + `avahi-dbus-daemon`）或 `192.168.5.157` Docker (`bitxeno/atvloadly`) | 通过宿主机 Avahi 发现 Apple TV，用免费 Apple ID 签名推送并每 7 天后台全自动续签（**推荐将常驻续签迁移到 24 小时不关机的 OpenWrt 路由器**） |
+| **无线安装与自动续签** | OpenWrt 不关机路由器（Docker + `avahi-dbus-daemon`）或 `<dev-host>` Docker (`bitxeno/atvloadly`) | 通过宿主机 Avahi 发现 Apple TV，用免费 Apple ID 签名推送并每 7 天后台全自动续签（**推荐将常驻续签迁移到 24 小时不关机的 OpenWrt 路由器**） |
 
 ### 1.3 给执行 AI 的 10 条铁律（Guardrails）
 
@@ -61,9 +61,9 @@
 │   └── workflows/
 │       └── tvos-ci.yml                         # Linux 单测 + macOS ARM64 产 AuraTV-Unsigned.ipa
 ├── Scripts/
-│   ├── setup-ubuntu-ai.sh                      # 192.168.5.157 初始化脚本
+│   ├── setup-ubuntu-ai.sh                      # <dev-host> 初始化脚本
 │   └── deploy/
-│       └── docker-compose.atvloadly.yml        # 192.168.5.157 无线安装与 7 天自动续签
+│       └── docker-compose.atvloadly.yml        # <dev-host> 无线安装与 7 天自动续签
 ├── Packages/
 │   └── MediaCoreKit/                           # [Linux & tvOS 双平台可编译测试]
 │       ├── Package.swift
@@ -134,10 +134,10 @@
 
 ### Phase 0：打通环境、空壳编译与真机无线安装闭环（必须最先跑通！）
 
-> **阶段目标**：不写任何复杂业务代码，先跑通「`192.168.5.157` 写代码 -> `swift test` 绿灯 -> GitHub Actions 生成 `AuraTV-Unsigned.ipa` -> `atvloadly` 装到 Apple TV 4K 真机亮屏」。管道通畅后再开始写核心功能。
+> **阶段目标**：不写任何复杂业务代码，先跑通「`<dev-host>` 写代码 -> `swift test` 绿灯 -> GitHub Actions 生成 `AuraTV-Unsigned.ipa` -> `atvloadly` 装到 Apple TV 4K 真机亮屏」。管道通畅后再开始写核心功能。
 
-#### Step 0.1：在 `192.168.5.157` 安装 Swift 6 与基础依赖
-- **执行位置**：`192.168.5.157`（用户 `lcj`）
+#### Step 0.1：在 `<dev-host>` 安装 Swift 6 与基础依赖
+- **执行位置**：`<dev-host>`（用户 `<user>`）
 - **操作**：创建目录 `/data/projects/AuraTV/Scripts`，写入并执行 `setup-ubuntu-ai.sh`：
 ```bash
 mkdir -p /data/projects/AuraTV/Scripts/deploy
@@ -178,7 +178,7 @@ bash /data/projects/AuraTV/Scripts/setup-ubuntu-ai.sh
   - `systemctl is-active docker` 输出 `active`。
 
 #### Step 0.2：初始化 Git 仓库、`MediaCoreKit` 空壳与最小 tvOS App
-- **执行位置**：`192.168.5.157:/data/projects/AuraTV`
+- **执行位置**：`<dev-host>:/data/projects/AuraTV`
 - **操作**：
   1. 执行 `git init -b main`，创建 `.gitignore`（忽略 `.build/`, `*.xcodeproj`, `build/`, `*.ipa`, `.DS_Store`）。
   2. 创建 `Packages/MediaCoreKit/Package.swift`：
@@ -338,11 +338,11 @@ bash /data/projects/AuraTV/Scripts/setup-ubuntu-ai.sh
                path: screenshots/*.png
      ```
 - **验收标准**：
-  - 在 `192.168.5.157` 运行 `cd /data/projects/AuraTV/Packages/MediaCoreKit && swift test` 全部通过。
+  - 在 `<dev-host>` 运行 `cd /data/projects/AuraTV/Packages/MediaCoreKit && swift test` 全部通过。
   - 推送到用户的 GitHub 仓库后，GitHub Actions 两个 Job 全绿，且能下载到 `AuraTV-Unsigned.ipa`。
 
-#### Step 0.3：在 `192.168.5.157` 启动 `atvloadly` 并完成首次真机亮屏验证
-- **执行位置**：`192.168.5.157` + Apple TV 4K 真机（由用户配合配对 PIN 码与登录免费 Apple ID）
+#### Step 0.3：在 `<dev-host>` 启动 `atvloadly` 并完成首次真机亮屏验证
+- **执行位置**：`<dev-host>` + Apple TV 4K 真机（由用户配合配对 PIN 码与登录免费 Apple ID）
 - **操作**：写入 `Scripts/deploy/docker-compose.atvloadly.yml` 并启动：
 ```yaml
 services:
@@ -361,7 +361,7 @@ services:
       - /var/run/avahi-daemon:/var/run/avahi-daemon
 ```
 ```bash
-sudo mkdir -p /data/atvloadly && sudo chown -R lcj:lcj /data/atvloadly
+sudo mkdir -p /data/atvloadly && sudo chown -R <user>:<user> /data/atvloadly
 cd /data/projects/AuraTV/Scripts/deploy
 docker compose -f docker-compose.atvloadly.yml up -d
 ```
@@ -382,9 +382,9 @@ docker compose -f docker-compose.atvloadly.yml up -d
 >     -v /var/run/avahi-daemon:/var/run/avahi-daemon \
 >     bitxeno/atvloadly:latest
 >   ```
-> - 若未来从 `192.168.5.157` 迁移到 OpenWrt，只需停止旧容器并将 `/data/atvloadly` 整个目录拷贝到 OpenWrt 的挂载目录再启动即可，配对记录与续签证书无缝继承。
+> - 若未来从 `<dev-host>` 迁移到 OpenWrt，只需停止旧容器并将 `/data/atvloadly` 整个目录拷贝到 OpenWrt 的挂载目录再启动即可，配对记录与续签证书无缝继承。
 - **人工配合验收标准**：
-  1. 浏览器访问 `http://192.168.5.157:5533`，发现局域网内的 Apple TV 4K 并完成配对；
+  1. 浏览器访问 `http://<dev-host>:5533`，发现局域网内的 Apple TV 4K 并完成配对；
   2. 登录专用免费 Apple ID，上传 Step 0.2 产出的 `AuraTV-Unsigned.ipa`；
   3. **Apple TV 4K 桌面出现 `AuraTV` 图标，打开后正常显示 `AuraTV Phase 0 Ready`**。
 - **Phase 0 门禁**：未看到真机亮屏前，禁止进入 Phase 1。
@@ -393,7 +393,7 @@ docker compose -f docker-compose.atvloadly.yml up -d
 
 ### Phase 1：在 Ubuntu 完整开发并测试 `MediaCoreKit` 核心库
 
-> **阶段目标**：在 `192.168.5.157` 本地写完并 100% 单元测试通过**网络协议抽象 + WebDAV + 本地流代理 + 滑动预读缓存 + 外挂字幕自动发现与编码转码 + 本地记录持久化**。这一阶段无需频繁跑 macOS CI，开发速度极快。
+> **阶段目标**：在 `<dev-host>` 本地写完并 100% 单元测试通过**网络协议抽象 + WebDAV + 本地流代理 + 滑动预读缓存 + 外挂字幕自动发现与编码转码 + 本地记录持久化**。这一阶段无需频繁跑 macOS CI，开发速度极快。
 
 #### Step 1.1：实现 `NetworkVFS` 核心协议与滑动预读缓存
 - **涉及文件**：
@@ -722,17 +722,17 @@ public struct RemoteKeyCaptureView: UIViewControllerRepresentable {
 
 | 序号 | 验收项 | 操作步骤 | 必须达到的结果 |
 | :--- | :--- | :--- | :--- |
-| 1 | **Ubuntu 自动化单测** | 在 `192.168.5.157:/data/projects/AuraTV/Packages/MediaCoreKit` 运行 `swift test` | 全部用例 100% PASS，无崩溃、无并发警告 |
+| 1 | **Ubuntu 自动化单测** | 在 `<dev-host>:/data/projects/AuraTV/Packages/MediaCoreKit` 运行 `swift test` | 全部用例 100% PASS，无崩溃、无并发警告 |
 | 2 | **CI 自动化产包** | `git push` 触发 GitHub Actions | `core-tests-ubuntu` 与 `build-tvos-unsigned-ipa` 全绿，产出 `AuraTV-Unsigned.ipa` |
-| 3 | **无线部署与续签** | `192.168.5.157:5533` (`atvloadly`) 推送到 Apple TV 4K | 无线安装成功，后台自动续签任务显示正常 |
-| 4 | **SMB / WebDAV 连接** | 添加局域网 SMB（如 `192.168.5.229`）与 WebDAV 源，执行测速与目录浏览 | Bonjour 自动发现正常；SMB 千兆有线读取 ≥ 300 Mbps；WebDAV 302 跳转直链起播稳定 |
+| 3 | **无线部署与续签** | `<dev-host>:5533` (`atvloadly`) 推送到 Apple TV 4K | 无线安装成功，后台自动续签任务显示正常 |
+| 4 | **SMB / WebDAV 连接** | 添加局域网 SMB（如 `192.168.1.10`）与 WebDAV 源，执行测速与目录浏览 | Bonjour 自动发现正常；SMB 千兆有线读取 ≥ 300 Mbps；WebDAV 302 跳转直链起播稳定 |
 | 5 | **全格式与画质音频** | 依次播放 4K 10-bit HEVC HDR10/Dolby Vision、AV1、H.264、TrueHD 7.1、DTS-HD MA | 电视准确点亮 HDR/Dolby Vision 徽标并切换 24Hz；退出恢复 4K 60Hz SDR；音频多声道 LPCM 正常同步 |
 | 6 | **外挂字幕自动与定制** | 播放带同目录 GBK `.srt` 和 `Subs/` 下 `.ass` 字幕的视频；在播放中打开字幕抽屉调位置、大小、颜色、不透明度、延迟与 ASS 覆盖 | 自动无乱码挂载首选简体中文外挂字幕；调节时主画面字幕**即时变化**；退出重进后偏好完整保留 |
 | 7 | **MX 风格长按实时快进** | 在 4K 大码率视频中短按与长按 Siri Remote 左/右键 | 短按精准 ±10s；**长按时全屏主画面以 ≥ 6fps 实时跟着变化、非线性平滑加速、无爆音、松手 < 0.8s 恢复音画同步** |
 | 8 | **UI 与内存稳定性** | 连续切换 10 部 4K 大文件并高频长按快进，同时检查性能监视器 | 遥控器焦点永不走丢；界面 60fps 流畅；内存峰值稳定在 **< 1.2 GB**，无闪退 |
 | 9 | **超长中日文与符号兼容性** | 浏览并播放含 100+ 字符中文/日文/符号（`# ? % & + [] 【】 ・`）的超长文件夹与片名 | 路径正常打开不报错；外挂字幕正常自动匹配（含 NFD/NFC 差异与 `第01話`）；右侧详情板完整展示全名无截断错位 |
 
-> **给用户的最终安装指南**：项目根目录已内置完整的保姆级安装文档 **`INSTALL_APPLETV.md`**（涵盖 GitHub Actions 下载 `AuraTV-Unsigned.ipa` -> `192.168.5.157:5533` 或 OpenWrt `atvloadly` 无线配对 Apple TV 4K tvOS 27 -> 免费 Apple ID 签名安装与 7 天自动续签 -> 常见故障排查）。全部 Phase 4 验收完毕后，执行 AI 须提醒用户按 `INSTALL_APPLETV.md` 安装最新版 `.ipa`。
+> **给用户的最终安装指南**：项目根目录已内置完整的保姆级安装文档 **`INSTALL_APPLETV.md`**（涵盖 GitHub Actions 下载 `AuraTV-Unsigned.ipa` -> `<dev-host>:5533` 或 OpenWrt `atvloadly` 无线配对 Apple TV 4K tvOS 27 -> 免费 Apple ID 签名安装与 7 天自动续签 -> 常见故障排查）。全部 Phase 4 验收完毕后，执行 AI 须提醒用户按 `INSTALL_APPLETV.md` 安装最新版 `.ipa`。
 
 ---
 
