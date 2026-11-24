@@ -5,14 +5,17 @@ import NetworkVFS
 
 /// SMB2/SMB3 provider backed by AMSMB2 (libsmb2).
 ///
-/// Path semantics: `MediaSourceConfig.basePath` selects the share
-/// (`/Movies` -> share `Movies`, root `/`). All VFS paths are relative to that
-/// share root. When `basePath == "/"` the root listing returns share names.
+/// Supports all 3 source configurations cleanly:
+/// 1. `basePath == "/"` (e.g. Bonjour auto-discovered host): root lists shares (`/AV`, `/Movies`);
+///    navigating into `/AV/...` dynamically connects share `AV` and strips the `/AV` prefix.
+/// 2. `basePath == "/AV"`: connects share `AV` upfront; browsing `/` lists share root.
+/// 3. `basePath == "/AV/Movies"`: connects share `AV` upfront and roots browsing at `/Movies`.
 public final class AMSMB2Provider: VFSProvider, @unchecked Sendable {
     public let scheme = "smb"
 
     private let config: MediaSourceConfig
     private let password: String
+
     private struct ConnectionState {
         var manager: SMB2Manager?
         var connectedShare: String?
@@ -25,24 +28,22 @@ public final class AMSMB2Provider: VFSProvider, @unchecked Sendable {
         self.password = password
     }
 
-    /// First path component of basePath, or nil when browsing share list.
-    private var shareName: String? {
-        let parts = config.basePath
+    private var configuredBaseParts: [String] {
+        Self.nfc(config.basePath)
             .split(separator: "/", omittingEmptySubsequences: true)
             .map(String.init)
-        return parts.first
     }
 
-    /// Strip the share prefix so all operations are share-relative.
-    private func relativePath(_ path: String) -> String {
-        let normalized = Self.nfc(path)
-        guard let share = shareName else { return normalized.isEmpty ? "/" : normalized }
-        let prefix = "/" + share
-        if normalized == prefix { return "/" }
-        if normalized.hasPrefix(prefix + "/") {
-            return String(normalized.dropFirst(prefix.count))
-        }
-        return normalized.isEmpty ? "/" : normalized
+    /// Configured share name from `basePath`, or `nil` when browsing server share list (`basePath == "/"`).
+    private var configuredShareName: String? {
+        configuredBaseParts.first
+    }
+
+    /// Subpath inside the configured share (e.g. `"/Movies"` when `basePath == "/AV/Movies"`), or `""`.
+    private var configuredShareSubpath: String {
+        let parts = configuredBaseParts
+        guard parts.count > 1 else { return "" }
+        return "/" + parts.dropFirst().joined(separator: "/")
     }
 
     private static func nfc(_ value: String) -> String {
@@ -61,11 +62,10 @@ public final class AMSMB2Provider: VFSProvider, @unchecked Sendable {
         guard let url = URL(string: urlString) else {
             throw VFSError.invalidURL(urlString)
         }
-        let credential = URLCredential(
-            user: config.username,
-            password: password,
-            persistence: .forSession
-        )
+        let credential: URLCredential? = config.username.isEmpty
+            ? nil
+            : URLCredential(user: config.username, password: password, persistence: .forSession)
+
         guard let newManager = SMB2Manager(url: url, domain: "", credential: credential) else {
             throw VFSError.invalidURL(urlString)
         }
@@ -74,18 +74,60 @@ public final class AMSMB2Provider: VFSProvider, @unchecked Sendable {
             $0.connectedShare = nil
         }
 
-        if let share = shareName {
-            try await connectShare(share, using: newManager)
+        if let share = configuredShareName {
+            try await ensureShareConnected(share, using: newManager)
         }
     }
 
-    private func connectShare(_ share: String, using manager: SMB2Manager) async throws {
+    private func ensureShareConnected(_ share: String, using manager: SMB2Manager, forceReconnect: Bool = false) async throws {
+        let alreadyConnected = stateLock.withLock { $0.connectedShare == share }
+        if alreadyConnected && !forceReconnect {
+            return
+        }
         do {
             try await manager.connectShare(name: share)
         } catch {
             throw VFSError.ioFailure("connectShare(\(share)) failed: \(error.localizedDescription)")
         }
         stateLock.withLock { $0.connectedShare = share }
+    }
+
+    /// Resolves a VFS virtual path into `(shareName, shareRelativePath)`.
+    /// Returns `nil` only when browsing the top-level share list (`basePath == "/"` and `path == "/"`).
+    private func resolveShareAndRelativePath(_ rawPath: String) -> (share: String, relativePath: String, virtualPrefix: String)? {
+        let normalized = Self.nfc(rawPath)
+        let pathParts = normalized
+            .split(separator: "/", omittingEmptySubsequences: true)
+            .map(String.init)
+
+        if let fixedShare = configuredShareName {
+            // Strip fixedShare prefix if caller passed full `/Share/...` path
+            var relParts = pathParts
+            if relParts.first == fixedShare {
+                relParts.removeFirst()
+            }
+            let baseSub = configuredShareSubpath
+            let rel: String
+            if relParts.isEmpty {
+                rel = baseSub.isEmpty ? "/" : baseSub
+            } else {
+                let joined = "/" + relParts.joined(separator: "/")
+                if !baseSub.isEmpty && !joined.hasPrefix(baseSub) {
+                    rel = baseSub + joined
+                } else {
+                    rel = joined
+                }
+            }
+            return (fixedShare, rel, "")
+        } else {
+            // Multi-share mode (`basePath == "/"`): first path component IS the share name
+            guard let first = pathParts.first else {
+                return nil // Browsing server share list `/`
+            }
+            let rest = pathParts.dropFirst()
+            let rel = rest.isEmpty ? "/" : ("/" + rest.joined(separator: "/"))
+            return (first, rel, "/\(first)")
+        }
     }
 
     public func disconnect() async {
@@ -101,16 +143,17 @@ public final class AMSMB2Provider: VFSProvider, @unchecked Sendable {
     public func listDirectory(at path: String) async throws -> [VFSFileItem] {
         let manager = try currentManager()
 
-        // Browsing the server root: enumerate shares instead of files.
-        if shareName == nil, relativePath(path) == "/" {
+        guard let resolved = resolveShareAndRelativePath(path) else {
+            // Server root: enumerate SMB shares
             let shares = try await manager.listShares()
             return shares
                 .filter { !$0.name.hasSuffix("$") }
                 .map { share in
-                    VFSFileItem(
-                        id: Self.nfc("/" + share.name),
-                        name: Self.nfc(share.name),
-                        path: Self.nfc("/" + share.name),
+                    let cleanName = Self.nfc(share.name)
+                    return VFSFileItem(
+                        id: "/\(cleanName)",
+                        name: cleanName,
+                        path: "/\(cleanName)",
                         isDirectory: true,
                         size: 0,
                         modifiedAt: nil
@@ -119,29 +162,38 @@ public final class AMSMB2Provider: VFSProvider, @unchecked Sendable {
                 .sorted { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
         }
 
-        let target = relativePath(path)
+        try await ensureShareConnected(resolved.share, using: manager)
+
         let entries: [[URLResourceKey: Any]]
         do {
-            entries = try await manager.contentsOfDirectory(atPath: target)
+            entries = try await manager.contentsOfDirectory(atPath: resolved.relativePath)
         } catch {
-            throw VFSError.ioFailure("contentsOfDirectory(\(target)) failed: \(error.localizedDescription)")
+            // Retry once after reconnecting share (handles idle SMB server disconnects)
+            try await ensureShareConnected(resolved.share, using: manager, forceReconnect: true)
+            do {
+                entries = try await manager.contentsOfDirectory(atPath: resolved.relativePath)
+            } catch {
+                throw VFSError.ioFailure("contentsOfDirectory(\(resolved.share):\(resolved.relativePath)) failed: \(error.localizedDescription)")
+            }
         }
 
         var items: [VFSFileItem] = []
         items.reserveCapacity(entries.count)
         for entry in entries {
             guard let name = entry[.nameKey] as? String else { continue }
-            // Hide metadata noise but keep normal dotfiles out of the browser.
             if name == "." || name == ".." { continue }
             guard let entryPath = entry[.pathKey] as? String else { continue }
             let isDirectory = (entry[.fileResourceTypeKey] as? URLFileResourceType) == .directory
             let size = (entry[.fileSizeKey] as? Int64) ?? 0
             let modified = entry[.contentModificationDateKey] as? Date
+
+            let cleanEntryPath = entryPath.hasPrefix("/") ? entryPath : "/" + entryPath
+            let fullVirtualPath = Self.nfc(resolved.virtualPrefix + cleanEntryPath)
             items.append(
                 VFSFileItem(
-                    id: Self.nfc(entryPath),
+                    id: fullVirtualPath,
                     name: Self.nfc(name),
-                    path: Self.nfc(entryPath),
+                    path: fullVirtualPath,
                     isDirectory: isDirectory,
                     size: size,
                     modifiedAt: modified
@@ -156,16 +208,46 @@ public final class AMSMB2Provider: VFSProvider, @unchecked Sendable {
 
     public func openStream(at path: String) async throws -> any VFSRandomAccessStream {
         let manager = try currentManager()
-        let target = relativePath(path)
-        let attributes = try await manager.attributesOfItem(atPath: target)
+        guard let resolved = resolveShareAndRelativePath(path) else {
+            throw VFSError.notFound(path)
+        }
+        try await ensureShareConnected(resolved.share, using: manager)
+        let attributes = try await manager.attributesOfItem(atPath: resolved.relativePath)
         let size = (attributes[.fileSizeKey] as? Int64) ?? 0
-        return AMSMB2RandomAccessStream(manager: manager, path: target, totalSize: size)
+        return AMSMB2RandomAccessStream(
+            provider: self,
+            manager: manager,
+            share: resolved.share,
+            path: resolved.relativePath,
+            totalSize: size
+        )
     }
 
     public func readFileData(at path: String, maxBytes: Int) async throws -> Data {
         let manager = try currentManager()
-        let target = relativePath(path)
-        return try await Self.read(manager: manager, path: target, offset: 0, length: maxBytes)
+        guard let resolved = resolveShareAndRelativePath(path) else {
+            throw VFSError.notFound(path)
+        }
+        try await ensureShareConnected(resolved.share, using: manager)
+        return try await readWithReconnect(manager: manager, share: resolved.share, path: resolved.relativePath, offset: 0, length: maxBytes)
+    }
+
+    func readWithReconnect(
+        manager: SMB2Manager,
+        share: String,
+        path: String,
+        offset: Int64,
+        length: Int
+    ) async throws -> Data {
+        do {
+            return try await Self.read(manager: manager, path: path, offset: offset, length: length)
+        } catch let err as VFSError where err == .cancelled {
+            throw err
+        } catch {
+            try Task.checkCancellation()
+            try await ensureShareConnected(share, using: manager, forceReconnect: true)
+            return try await Self.read(manager: manager, path: path, offset: offset, length: length)
+        }
     }
 
     static func read(
@@ -180,6 +262,7 @@ public final class AMSMB2Provider: VFSProvider, @unchecked Sendable {
         buffer.reserveCapacity(length)
         do {
             for try await chunk in manager.contents(atPath: path, range: offset..<upper) {
+                try Task.checkCancellation()
                 buffer.append(chunk)
                 if buffer.count >= length { break }
             }
@@ -187,21 +270,26 @@ public final class AMSMB2Provider: VFSProvider, @unchecked Sendable {
             if error is CancellationError { throw VFSError.cancelled }
             throw VFSError.ioFailure("read(\(path), \(offset)+\(length)) failed: \(error.localizedDescription)")
         }
-        if buffer.count > length { buffer = buffer.prefix(length) }
+        if buffer.count > length {
+            buffer = Data(buffer.prefix(length))
+        }
         return buffer
     }
 }
 
-/// Random-access stream over an AMSMB2 share. Each `read` is an independent
-/// ranged request so a cancelled seek never poisons later reads.
+/// Random-access stream over an AMSMB2 share.
 public final class AMSMB2RandomAccessStream: VFSRandomAccessStream, @unchecked Sendable {
     public let totalSize: Int64
+    private let provider: AMSMB2Provider
     private let manager: SMB2Manager
+    private let share: String
     private let path: String
     private let closed = ManagedAtomicFlag()
 
-    init(manager: SMB2Manager, path: String, totalSize: Int64) {
+    init(provider: AMSMB2Provider, manager: SMB2Manager, share: String, path: String, totalSize: Int64) {
+        self.provider = provider
         self.manager = manager
+        self.share = share
         self.path = path
         self.totalSize = totalSize
     }
@@ -214,8 +302,9 @@ public final class AMSMB2RandomAccessStream: VFSRandomAccessStream, @unchecked S
         guard offset < totalSize else { return Data() }
         let capped = Int(min(Int64(length), totalSize - offset))
         try Task.checkCancellation()
-        return try await AMSMB2Provider.read(
+        return try await provider.readWithReconnect(
             manager: manager,
+            share: share,
             path: path,
             offset: offset,
             length: capped
@@ -227,11 +316,8 @@ public final class AMSMB2RandomAccessStream: VFSRandomAccessStream, @unchecked S
     }
 }
 
-/// Minimal atomic flag so the stream stays Sendable without importing Atomics.
 final class ManagedAtomicFlag: @unchecked Sendable {
     private let lock = OSAllocatedUnfairLock<Bool>(initialState: false)
-
     var isSet: Bool { lock.withLock { $0 } }
-
     func set() { lock.withLock { $0 = true } }
 }

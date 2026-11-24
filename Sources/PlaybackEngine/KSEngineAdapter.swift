@@ -3,6 +3,7 @@ import CoreMedia
 import UIKit
 import SwiftUI
 import Combine
+import os
 
 #if canImport(KSPlayer) && !targetEnvironment(simulator)
 import KSPlayer
@@ -17,9 +18,25 @@ private final class AuraKSOptions: KSOptions {
     }
 }
 
+/// Thread-safe one-shot continuation wrapper so superseded or timed-out KSPlayer seeks NEVER leak or hang.
+private final class OneShotSeekContinuation: @unchecked Sendable {
+    private let lock = OSAllocatedUnfairLock<CheckedContinuation<Void, Never>?>(initialState: nil)
+
+    func store(_ continuation: CheckedContinuation<Void, Never>) {
+        lock.withLock { $0 = continuation }
+    }
+
+    func resumeOnce() {
+        let cont = lock.withLock { current -> CheckedContinuation<Void, Never>? in
+            let saved = current
+            current = nil
+            return saved
+        }
+        cont?.resume()
+    }
+}
+
 /// KSPlayer 5.6.2 (FFmpeg + VideoToolbox + Metal) adapter.
-/// Supports MKV, TS, M2TS, AVI, AV1, HEVC 10-bit, Dolby Vision (including P7->P8.1),
-/// HDR10/HLG, TrueHD / DTS-HD MA multi-channel LPCM, and embedded PGS/ASS subtitles.
 @MainActor
 public final class KSEngineAdapter: NSObject, ObservableObject, PlayerEngineProtocol, KSPlayerLayerDelegate {
     @Published public private(set) var currentTime: TimeInterval = 0
@@ -28,6 +45,8 @@ public final class KSEngineAdapter: NSObject, ObservableObject, PlayerEngineProt
     @Published public private(set) var audioTracks: [EngineTrackInfo] = []
     @Published public private(set) var embeddedSubtitleTracks: [EngineTrackInfo] = []
     @Published public private(set) var lastError: String?
+    /// Incremented whenever a new KSPlayerLayer is created so KSLayerRepresentable mounts the video view.
+    @Published public private(set) var layerRevision: Int = 0
 
     public private(set) var playbackRate: Float = 1.0
     public private(set) var videoFormatDescription: CMFormatDescription?
@@ -44,6 +63,10 @@ public final class KSEngineAdapter: NSObject, ObservableObject, PlayerEngineProt
         opts.isAutoPlay = true
         opts.isAccurateSeek = true
         opts.isSeekedAutoPlay = true
+        // Critical for MX live fast-forward: interrupt stale SMB/WebDAV IO immediately on seek
+        // and snap directly to nearest backward I-frame (AVSEEK_FLAG_BACKWARD = 1).
+        opts.seekInterruptIO = true
+        opts.seekFlags = 1
         opts.changeDV7ToDV81 = true
         opts.autoSelectEmbedSubtitle = false
         opts.preferredForwardBufferDuration = 6
@@ -58,13 +81,8 @@ public final class KSEngineAdapter: NSObject, ObservableObject, PlayerEngineProt
         }
     }
 
-    public func makeLayerView() -> UIView {
-        if let playerLayer {
-            return playerLayer.makeUIView()
-        }
-        let view = UIView()
-        view.backgroundColor = .black
-        return view
+    public func makeLayerView() -> UIView? {
+        playerLayer?.makeUIView()
     }
 
     public func updateLayerView(_ view: UIView) {
@@ -78,12 +96,15 @@ public final class KSEngineAdapter: NSObject, ObservableObject, PlayerEngineProt
         options.isSeekedAutoPlay = true
 
         if let existing = playerLayer {
+            existing.delegate = nil
             existing.stop()
             existing.reset()
         }
 
         let layer = KSPlayerLayer(url: url, options: options, delegate: self)
         self.playerLayer = layer
+        // Notify KSLayerRepresentable immediately so the Metal/VideoToolbox surface is mounted into the window!
+        self.layerRevision += 1
 
         try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
             self.loadContinuation = continuation
@@ -105,22 +126,35 @@ public final class KSEngineAdapter: NSObject, ObservableObject, PlayerEngineProt
         guard let playerLayer else { return }
         options.isAccurateSeek = precise
         options.isSeekedAutoPlay = isPlaying
-        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
-            playerLayer.seek(time: max(0, time), autoPlay: isPlaying) { _ in
-                continuation.resume()
-            }
-        }
+        await performGuardedSeek(layer: playerLayer, time: max(0, time), autoPlay: isPlaying, timeoutNs: 2_000_000_000)
     }
 
     public func seekToKeyframePreview(at time: TimeInterval) async {
         guard let playerLayer else { return }
         options.isAccurateSeek = false
         options.isSeekedAutoPlay = false
+        // 500ms timeout guarantees single-flight scrubbing NEVER hangs if KSPlayer drops an older seek callback.
+        await performGuardedSeek(layer: playerLayer, time: max(0, time), autoPlay: false, timeoutNs: 500_000_000)
+    }
+
+    private func performGuardedSeek(
+        layer: KSPlayerLayer,
+        time: TimeInterval,
+        autoPlay: Bool,
+        timeoutNs: UInt64
+    ) async {
+        let guardBox = OneShotSeekContinuation()
+        let timeoutTask = Task {
+            try? await Task.sleep(nanoseconds: timeoutNs)
+            guardBox.resumeOnce()
+        }
         await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
-            playerLayer.seek(time: max(0, time), autoPlay: false) { _ in
-                continuation.resume()
+            guardBox.store(continuation)
+            layer.seek(time: time, autoPlay: autoPlay) { _ in
+                guardBox.resumeOnce()
             }
         }
+        timeoutTask.cancel()
     }
 
     public func setMuted(_ muted: Bool) {
@@ -184,9 +218,11 @@ public final class KSEngineAdapter: NSObject, ObservableObject, PlayerEngineProt
     }
 
     public func shutdown() {
+        playerLayer?.delegate = nil
         playerLayer?.stop()
         playerLayer?.reset()
         playerLayer = nil
+        layerRevision += 1
         if let cont = loadContinuation {
             loadContinuation = nil
             cont.resume(throwing: CancellationError())
@@ -273,6 +309,12 @@ public final class KSEngineAdapter: NSObject, ObservableObject, PlayerEngineProt
     }
 }
 
+public final class KSContainerView: UIView {
+    var mountedRevision: Int = -1
+    weak var mountedLayerView: UIView?
+}
+
+/// Mounts KSPlayerLayer's Metal/VideoToolbox view reliably as soon as `layerRevision` updates.
 public struct KSLayerRepresentable: UIViewRepresentable {
     @ObservedObject var adapter: KSEngineAdapter
 
@@ -280,12 +322,36 @@ public struct KSLayerRepresentable: UIViewRepresentable {
         self.adapter = adapter
     }
 
-    public func makeUIView(context: Context) -> UIView {
-        adapter.makeLayerView()
+    public func makeUIView(context: Context) -> KSContainerView {
+        let container = KSContainerView()
+        container.backgroundColor = .black
+        mountIfNeeded(container)
+        return container
     }
 
-    public func updateUIView(_ uiView: UIView, context: Context) {
-        adapter.updateLayerView(uiView)
+    public func updateUIView(_ uiView: KSContainerView, context: Context) {
+        mountIfNeeded(uiView)
+        if let mounted = uiView.mountedLayerView {
+            adapter.updateLayerView(mounted)
+        }
+    }
+
+    private func mountIfNeeded(_ container: KSContainerView) {
+        guard container.mountedRevision != adapter.layerRevision else { return }
+        container.mountedRevision = adapter.layerRevision
+        container.subviews.forEach { $0.removeFromSuperview() }
+        container.mountedLayerView = nil
+
+        guard let layerView = adapter.makeLayerView() else { return }
+        layerView.translatesAutoresizingMaskIntoConstraints = false
+        container.addSubview(layerView)
+        NSLayoutConstraint.activate([
+            layerView.leadingAnchor.constraint(equalTo: container.leadingAnchor),
+            layerView.trailingAnchor.constraint(equalTo: container.trailingAnchor),
+            layerView.topAnchor.constraint(equalTo: container.topAnchor),
+            layerView.bottomAnchor.constraint(equalTo: container.bottomAnchor)
+        ])
+        container.mountedLayerView = layerView
     }
 }
 #endif

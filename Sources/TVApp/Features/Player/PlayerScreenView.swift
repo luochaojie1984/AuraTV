@@ -40,9 +40,10 @@ struct PlayerScreenView: View {
     @State private var enginePreference: PreferredEngineChoice = .auto
     @State private var subtitleTrack: ParsedSubtitleTrack?
     @State private var subtitleNotice: String?
-    @State private var showHUD = true
+    @State private var showHUD = false
     @State private var showSubtitleDrawer = false
     @State private var showAudioDrawer = false
+    @State private var shortSeekNotice: String?
     @State private var showStats = false
     @State private var isFastPlaying = false
     @State private var fastPlayDirection: ScrubDirection = .forward
@@ -78,7 +79,7 @@ struct PlayerScreenView: View {
             .ignoresSafeArea()
 
             RemoteKeyCaptureView(
-                isCaptureEnabled: !anyDrawerOpen,
+                isCaptureEnabled: !showHUD && !anyDrawerOpen && loadError == nil,
                 onShortPress: { dir in
                     Task { await shortSeek(dir) }
                 },
@@ -88,20 +89,19 @@ struct PlayerScreenView: View {
                 onLongPressEnded: {
                     endLongHold()
                 },
+                onShowHUD: {
+                    showHUD = true
+                    scheduleHUDHide()
+                },
                 onPlayPause: {
                     togglePlayback()
                 },
                 onMenu: {
-                    if showSubtitleDrawer {
-                        showSubtitleDrawer = false
-                    } else if showAudioDrawer {
-                        showAudioDrawer = false
-                    } else {
-                        shutdown()
-                    }
+                    shutdown()
                 }
             )
-            .allowsHitTesting(false)
+            .ignoresSafeArea()
+            .allowsHitTesting(!showHUD && !anyDrawerOpen && loadError == nil)
 
             VStack {
                 if showStats {
@@ -112,6 +112,14 @@ struct PlayerScreenView: View {
                     scrubPill
                 } else if isFastPlaying {
                     fastPlayPill
+                } else if let shortSeekNotice {
+                    Text(shortSeekNotice)
+                        .font(.system(size: 24, weight: .bold, design: .monospaced))
+                        .foregroundStyle(TVTheme.accent)
+                        .padding(.horizontal, 24)
+                        .padding(.vertical, 12)
+                        .tvGlassSurface(cornerRadius: 18)
+                        .padding(.bottom, 16)
                 }
                 if showHUD {
                     PlayerHUDView(
@@ -229,6 +237,18 @@ struct PlayerScreenView: View {
         .task { await startPlayback() }
         .onChange(of: engine.currentTime) { _, newValue in
             persistProgress(newValue)
+        }
+        .onExitCommand {
+            if showSubtitleDrawer {
+                showSubtitleDrawer = false
+            } else if showAudioDrawer {
+                showAudioDrawer = false
+            } else if showHUD {
+                hudHideTask?.cancel()
+                showHUD = false
+            } else {
+                shutdown()
+            }
         }
         .onDisappear {
             shutdown()
@@ -403,11 +423,17 @@ struct PlayerScreenView: View {
     }
 
     private func shortSeek(_ direction: ScrubDirection) async {
+        let stepSeconds = Int(env.settings.shortSeekSeconds)
         let step = env.settings.shortSeekSeconds * Double(direction.rawValue)
         let target = min(max(0, engine.currentTime + step), max(0, engine.duration))
+        shortSeekNotice = direction == .forward
+            ? ">>> +\(stepSeconds)s  |  \(formatTime(target))"
+            : "<<< -\(stepSeconds)s  |  \(formatTime(target))"
         await engine.seek(to: target, precise: true)
-        showHUD = true
-        scheduleHUDHide()
+        Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 1_000_000_000)
+            shortSeekNotice = nil
+        }
     }
 
     private func beginLongHold(_ direction: ScrubDirection) {
