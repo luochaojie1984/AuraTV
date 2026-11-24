@@ -67,6 +67,7 @@ public final class AppEnvironment: ObservableObject {
         historyByKey = map
         if let loaded = try? await settingsStore.load() {
             settings = loaded
+            UISoundPlayer.shared.isEnabled = loaded.enableUISoundEffects
         }
     }
 
@@ -123,6 +124,7 @@ public final class AppEnvironment: ObservableObject {
         do {
             try await settingsStore.save(next)
             settings = next
+            UISoundPlayer.shared.isEnabled = next.enableUISoundEffects
         } catch {
             proxyError = "设置保存失败：\(error.localizedDescription)"
         }

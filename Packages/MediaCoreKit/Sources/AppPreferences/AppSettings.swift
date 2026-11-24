@@ -69,6 +69,7 @@ public struct AppSettings: Codable, Equatable, Sendable {
 
     // Playback resume (记忆播放 / 断点续播) & remembered LAN folders
     public var enableResumePlayback: Bool
+    public var enableUISoundEffects: Bool
     public var lastVisitedPaths: [String: String]
 
     public var readAheadCacheLimitMB: Int
@@ -86,6 +87,7 @@ public struct AppSettings: Codable, Equatable, Sendable {
         showScrubTimeText: Bool = true,
         scrubTimeTextOpacity: Double = 0.72,
         enableResumePlayback: Bool = true,
+        enableUISoundEffects: Bool = true,
         lastVisitedPaths: [String: String] = [:],
         readAheadCacheLimitMB: Int = 96,
         subtitleStyle: SubtitleStyleConfig = SubtitleStyleConfig()
@@ -101,6 +103,7 @@ public struct AppSettings: Codable, Equatable, Sendable {
         self.showScrubTimeText = showScrubTimeText
         self.scrubTimeTextOpacity = scrubTimeTextOpacity
         self.enableResumePlayback = enableResumePlayback
+        self.enableUISoundEffects = enableUISoundEffects
         self.lastVisitedPaths = lastVisitedPaths
         self.readAheadCacheLimitMB = readAheadCacheLimitMB
         self.subtitleStyle = subtitleStyle
@@ -118,6 +121,7 @@ public struct AppSettings: Codable, Equatable, Sendable {
         case showScrubTimeText
         case scrubTimeTextOpacity
         case enableResumePlayback
+        case enableUISoundEffects
         case lastVisitedPaths
         case readAheadCacheLimitMB
         case subtitleStyle
@@ -136,6 +140,7 @@ public struct AppSettings: Codable, Equatable, Sendable {
         self.showScrubTimeText = try c.decodeIfPresent(Bool.self, forKey: .showScrubTimeText) ?? true
         self.scrubTimeTextOpacity = try c.decodeIfPresent(Double.self, forKey: .scrubTimeTextOpacity) ?? 0.72
         self.enableResumePlayback = try c.decodeIfPresent(Bool.self, forKey: .enableResumePlayback) ?? true
+        self.enableUISoundEffects = try c.decodeIfPresent(Bool.self, forKey: .enableUISoundEffects) ?? true
         self.lastVisitedPaths = try c.decodeIfPresent([String: String].self, forKey: .lastVisitedPaths) ?? [:]
         self.readAheadCacheLimitMB = try c.decodeIfPresent(Int.self, forKey: .readAheadCacheLimitMB) ?? 96
         self.subtitleStyle = try c.decodeIfPresent(SubtitleStyleConfig.self, forKey: .subtitleStyle) ?? SubtitleStyleConfig()

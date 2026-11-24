@@ -40,11 +40,17 @@ struct AppSettingsView: View {
                             .font(.system(size: 18, weight: .medium))
                             .frame(width: 220, alignment: .leading)
 
-                        Button("− 5s") {
+                        Button {
                             let next = max(5.0, env.settings.shortSeekSeconds - 5.0)
                             Task { await env.updateSettings { $0.shortSeekSeconds = next } }
+                        } label: {
+                            Text("− 5s")
+                                .font(.system(size: 17, weight: .semibold, design: .monospaced))
+                                .padding(.horizontal, 16)
+                                .padding(.vertical, 8)
+                                .background(Color.white.opacity(0.12), in: Capsule())
                         }
-                        .buttonStyle(.bordered)
+                        .buttonStyle(TVOptionButtonStyle())
                         .disabled(env.settings.shortSeekSeconds <= 5)
 
                         Text("\(Int(env.settings.shortSeekSeconds)) 秒")
@@ -52,11 +58,17 @@ struct AppSettingsView: View {
                             .foregroundStyle(TVTheme.accent)
                             .frame(width: 96)
 
-                        Button("+ 5s") {
+                        Button {
                             let next = min(120.0, env.settings.shortSeekSeconds + 5.0)
                             Task { await env.updateSettings { $0.shortSeekSeconds = next } }
+                        } label: {
+                            Text("+ 5s")
+                                .font(.system(size: 17, weight: .semibold, design: .monospaced))
+                                .padding(.horizontal, 16)
+                                .padding(.vertical, 8)
+                                .background(Color.white.opacity(0.12), in: Capsule())
                         }
-                        .buttonStyle(.bordered)
+                        .buttonStyle(TVOptionButtonStyle())
                         .disabled(env.settings.shortSeekSeconds >= 120)
 
                         Spacer().frame(width: 12)
@@ -75,7 +87,7 @@ struct AppSettingsView: View {
                                         in: Capsule()
                                     )
                             }
-                            .buttonStyle(.plain)
+                            .buttonStyle(TVOptionButtonStyle())
                         }
                         Spacer()
                     }
@@ -153,7 +165,7 @@ struct AppSettingsView: View {
                                     in: Capsule()
                                 )
                             }
-                            .buttonStyle(.plain)
+                            .buttonStyle(TVOptionButtonStyle())
                         }
                         Spacer()
                     }
@@ -230,7 +242,23 @@ struct AppSettingsView: View {
                         .foregroundStyle(TVTheme.tertiaryText)
                 }
 
-                // 4. 局域网自动记住 & 缓存
+                // 4. 界面交互动效与音效
+                group("界面动效与音效") {
+                    optionRow(
+                        title: "焦点与按键音效",
+                        options: ["开启 (推荐)", "关闭"],
+                        selectedIndex: env.settings.enableUISoundEffects ? 0 : 1
+                    ) { index in
+                        let enabled = (index == 0)
+                        UISoundPlayer.shared.isEnabled = enabled
+                        Task { await env.updateSettings { $0.enableUISoundEffects = enabled } }
+                    }
+                    Text("遥控器移动焦点、点击选项与返回时播放轻柔苹果风提示音（与视频播放混音，不打断正片声音）。")
+                        .font(.system(size: 16))
+                        .foregroundStyle(TVTheme.tertiaryText)
+                }
+
+                // 5. 局域网自动记住 & 缓存
                 group("局域网连接与缓存") {
                     Text("已自动记住 \(env.sources.count) 个局域网网络源（含 SMB / WebDAV / Bonjour 发现）。应用启动后会在后台自动保持连接并记住上次浏览的文件夹，无需每次重连。")
                         .font(.system(size: 17))
@@ -383,7 +411,7 @@ struct AppSettingsView: View {
                             in: Capsule()
                         )
                 }
-                .buttonStyle(.plain)
+                .buttonStyle(TVOptionButtonStyle())
             }
             Spacer()
         }

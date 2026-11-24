@@ -71,7 +71,7 @@ struct HomeView: View {
                                 barColor: Color(hex: env.settings.scrubBarColorHex)
                             )
                         }
-                        .buttonStyle(.plain)
+                        .buttonStyle(TVCardButtonStyle())
                     }
                 }
                 .padding(.vertical, 12)
@@ -98,7 +98,7 @@ struct HomeView: View {
                                 isConnected: env.connectedSourceIDs.contains(source.id)
                             )
                         }
-                        .buttonStyle(.plain)
+                        .buttonStyle(TVCardButtonStyle())
                     }
                 }
             }
@@ -148,9 +148,8 @@ struct HomeView: View {
                                 Spacer()
                             }
                             .padding(18)
-                            .tvGlassSurface(cornerRadius: 18)
                         }
-                        .buttonStyle(.plain)
+                        .buttonStyle(TVCardButtonStyle(cornerRadius: 18))
                     }
                 }
             }
@@ -192,7 +191,6 @@ struct HomeView: View {
 struct SourceCard: View {
     let source: MediaSourceConfig
     var isConnected: Bool = false
-    @FocusState private var focused: Bool
 
     var body: some View {
         HStack(spacing: 18) {
@@ -219,15 +217,12 @@ struct SourceCard: View {
         }
         .padding(22)
         .frame(height: 118)
-        .tvCardFocus(focused)
-        .focused($focused)
     }
 }
 
 struct ContinueWatchingCard: View {
     let record: PlaybackHistoryRecord
     var barColor: Color = TVTheme.accent
-    @FocusState private var focused: Bool
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
@@ -244,8 +239,6 @@ struct ContinueWatchingCard: View {
         }
         .padding(18)
         .frame(width: 396)
-        .tvCardFocus(focused)
-        .focused($focused)
     }
 
     private func formatted(_ seconds: TimeInterval) -> String {

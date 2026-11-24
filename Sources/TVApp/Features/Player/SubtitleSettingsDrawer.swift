@@ -21,10 +21,15 @@ struct SubtitleSettingsDrawer: View {
                         .foregroundStyle(TVTheme.secondaryText)
                 }
                 Spacer()
-                Button(action: onClose) {
-                    Image(systemName: "xmark.circle.fill").font(.system(size: 28))
+                Button {
+                    UISoundPlayer.shared.playBack()
+                    onClose()
+                } label: {
+                    Image(systemName: "xmark.circle.fill")
+                        .font(.system(size: 28))
+                        .padding(4)
                 }
-                .buttonStyle(.plain)
+                .buttonStyle(TVOptionButtonStyle())
             }
             .padding(.horizontal, 26)
             .padding(.vertical, 20)
@@ -101,7 +106,7 @@ struct SubtitleSettingsDrawer: View {
                                 )
                             )
                     }
-                    .buttonStyle(.plain)
+                    .buttonStyle(TVOptionButtonStyle())
                 }
             }
         }
@@ -127,7 +132,7 @@ struct SubtitleSettingsDrawer: View {
                                 in: Capsule()
                             )
                     }
-                    .buttonStyle(.plain)
+                    .buttonStyle(TVOptionButtonStyle())
                 }
             }
         }
@@ -155,7 +160,7 @@ struct SubtitleSettingsDrawer: View {
                         in: Capsule()
                     )
             }
-            .buttonStyle(.plain)
+            .buttonStyle(TVOptionButtonStyle())
         }
         .padding(14)
         .background(Color.white.opacity(0.05), in: RoundedRectangle(cornerRadius: 14, style: .continuous))
@@ -180,12 +185,12 @@ struct SubtitleSettingsDrawer: View {
             Text(title).font(.system(size: 19, weight: .medium))
             Spacer()
             Button(action: onMinus) { Image(systemName: "minus.circle.fill").font(.system(size: 26)) }
-                .buttonStyle(.plain)
+                .buttonStyle(TVOptionButtonStyle())
             Text(value)
                 .font(.system(size: 19, weight: .semibold, design: .monospaced))
                 .frame(width: 110)
             Button(action: onPlus) { Image(systemName: "plus.circle.fill").font(.system(size: 26)) }
-                .buttonStyle(.plain)
+                .buttonStyle(TVOptionButtonStyle())
         }
         .padding(.horizontal, 14)
         .padding(.vertical, 12)

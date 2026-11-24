@@ -16,7 +16,7 @@ struct AudioAndEngineDrawer: View {
                 Text("音轨与解码引擎")
                     .font(.system(size: 28, weight: .bold))
                 Spacer()
-                Button(action: onClose) {
+                Button { UISoundPlayer.shared.playBack(); onClose() } label: {
                     Image(systemName: "xmark")
                 }
                 .buttonStyle(.bordered)

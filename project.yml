@@ -19,6 +19,11 @@ targets:
     platform: tvOS
     sources:
       - path: Sources/TVApp
+        excludes:
+          - Resources/Sounds/**
+      - path: Sources/TVApp/Resources/Sounds
+        type: folder
+        buildPhase: resources
       - path: Sources/TVAdapters
       - path: Sources/PlaybackEngine
     dependencies:

@@ -37,7 +37,7 @@ struct SourceListView: View {
                         } label: {
                             SourceCard(source: source, isConnected: env.connectedSourceIDs.contains(source.id))
                         }
-                        .buttonStyle(.plain)
+                        .buttonStyle(TVCardButtonStyle())
 
                         VStack(spacing: 12) {
                             Button("编辑") { editingSource = source }

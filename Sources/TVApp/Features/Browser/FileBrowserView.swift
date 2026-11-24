@@ -91,7 +91,10 @@ struct FileBrowserView: View {
 
     private var topBar: some View {
         HStack(spacing: 18) {
-            Button { dismiss() } label: {
+            Button {
+                UISoundPlayer.shared.playBack()
+                dismiss()
+            } label: {
                 Label("返回", systemImage: "chevron.left")
             }
             .buttonStyle(.bordered)
@@ -162,11 +165,12 @@ struct FileBrowserView: View {
                 LazyVStack(alignment: .leading, spacing: 0) {
                     if path != "/" {
                         Button {
+                            UISoundPlayer.shared.playBack()
                             Task { await goUp() }
                         } label: {
                             row(id: "up", name: "⬅︎ 上一级", subtitle: "", isDir: true, badges: [], progress: nil)
                         }
-                        .buttonStyle(.plain)
+                        .buttonStyle(TVListRowButtonStyle())
                     }
                     ForEach(visibleItems) { item in
                         let hist = item.isVideo ? env.historyRecord(for: activeSource.id, filePath: item.path) : nil
@@ -192,7 +196,7 @@ struct FileBrowserView: View {
                                 progress: resumeRatio
                             )
                         }
-                        .buttonStyle(.plain)
+                        .buttonStyle(TVListRowButtonStyle())
                         .focused($focusedItemID, equals: item.id)
                         .onChange(of: focusedItemID) { _, newValue in
                             if newValue == item.id { focused = item }
@@ -254,10 +258,6 @@ struct FileBrowserView: View {
         }
         .padding(.horizontal, 20)
         .padding(.vertical, 14)
-        .background(
-            RoundedRectangle(cornerRadius: 14, style: .continuous)
-                .fill(focusedItemID == id ? TVTheme.cardFocused : Color.clear)
-        )
         .contentShape(Rectangle())
     }
 
