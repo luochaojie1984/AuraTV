@@ -101,6 +101,10 @@ struct SourceEditorView: View {
     @State private var isSaving = false
     @State private var errorText: String?
 
+    private var hasSavedPassword: Bool {
+        existing.map { KeychainCredentialStore.hasPassword(forKey: $0.credentialKey) } ?? false
+    }
+
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 14) {
@@ -133,7 +137,7 @@ struct SourceEditorView: View {
                 secureField(
                     "密码",
                     text: $password,
-                    placeholder: existing == nil ? "输入密码（留空则无密码）" : "留空则保留原密码"
+                    placeholder: existing == nil ? "输入密码（留空则无密码）" : (hasSavedPassword ? "已保存密码（留空则保留）" : "未保存密码，请输入密码")
                 )
 
                 if protocolType == .webdav {
@@ -277,9 +281,18 @@ struct SourceEditorView: View {
             normalizedBasePath = withLeading
         }
 
+        let resolvedDisplayName: String
+        if let existing, cleanDisplayName == existing.host && cleanHost != existing.host {
+            resolvedDisplayName = cleanHost
+        } else if cleanDisplayName.isEmpty {
+            resolvedDisplayName = cleanHost
+        } else {
+            resolvedDisplayName = cleanDisplayName
+        }
+
         let config = MediaSourceConfig(
             id: existing?.id ?? UUID(),
-            displayName: cleanDisplayName.isEmpty ? cleanHost : cleanDisplayName,
+            displayName: resolvedDisplayName,
             protocolType: protocolType,
             host: cleanHost,
             port: parsedPort,

@@ -1,8 +1,8 @@
 import Foundation
 import Security
 
-/// Keychain-backed credential storage with a sideload-safe fallback when Keychain
-/// entitlements are unavailable. Passwords never touch the JSON source store.
+/// Keychain-backed credential storage with an always-updated obfuscated UserDefaults
+/// mirror so sideloaded overwrite-installs never lose saved passwords.
 public enum KeychainCredentialStore {
     public enum StoreError: Error, LocalizedError {
         case unexpectedStatus(OSStatus)
@@ -19,7 +19,10 @@ public enum KeychainCredentialStore {
     private static let fallbackPrefix = "local.personal.auratv.cred.fb."
 
     private static func isFallbackEligible(_ status: OSStatus) -> Bool {
-        status == errSecMissingEntitlement || status == errSecNotAvailable
+        status == errSecMissingEntitlement
+            || status == errSecNotAvailable
+            || status == errSecAuthFailed
+            || status == errSecInteractionNotAllowed
     }
 
     private static func xorMask(_ input: [UInt8], key: String) -> [UInt8] {
@@ -44,6 +47,9 @@ public enum KeychainCredentialStore {
     }
 
     public static func savePassword(_ password: String, forKey key: String) throws {
+        // Always persist obfuscated mirror first so sideload re-signing / overwrite installs retain credentials.
+        UserDefaults.standard.set(encodeFallback(password, forKey: key), forKey: fallbackPrefix + key)
+
         let data = Data(password.utf8)
         let query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
@@ -57,8 +63,7 @@ public enum KeychainCredentialStore {
         ]
 
         let updateStatus = SecItemUpdate(query as CFDictionary, attributes as CFDictionary)
-        if updateStatus == errSecSuccess {
-            UserDefaults.standard.removeObject(forKey: fallbackPrefix + key)
+        if updateStatus == errSecSuccess || isFallbackEligible(updateStatus) {
             return
         }
 
@@ -66,21 +71,12 @@ public enum KeychainCredentialStore {
             var insert = query
             insert.merge(attributes) { _, new in new }
             let addStatus = SecItemAdd(insert as CFDictionary, nil)
-            if addStatus == errSecSuccess {
-                UserDefaults.standard.removeObject(forKey: fallbackPrefix + key)
-                return
-            }
-            if isFallbackEligible(addStatus) {
-                UserDefaults.standard.set(encodeFallback(password, forKey: key), forKey: fallbackPrefix + key)
+            if addStatus == errSecSuccess || isFallbackEligible(addStatus) {
                 return
             }
             throw StoreError.unexpectedStatus(addStatus)
         }
 
-        if isFallbackEligible(updateStatus) {
-            UserDefaults.standard.set(encodeFallback(password, forKey: key), forKey: fallbackPrefix + key)
-            return
-        }
         throw StoreError.unexpectedStatus(updateStatus)
     }
 
@@ -96,7 +92,11 @@ public enum KeychainCredentialStore {
         let status = SecItemCopyMatching(query as CFDictionary, &item)
         if status == errSecSuccess,
            let data = item as? Data,
-           let decoded = String(data: data, encoding: .utf8) {
+           let decoded = String(data: data, encoding: .utf8),
+           !decoded.isEmpty {
+            if UserDefaults.standard.string(forKey: fallbackPrefix + key) == nil {
+                UserDefaults.standard.set(encodeFallback(decoded, forKey: key), forKey: fallbackPrefix + key)
+            }
             return decoded
         }
         if let encoded = UserDefaults.standard.string(forKey: fallbackPrefix + key) {
@@ -118,6 +118,6 @@ public enum KeychainCredentialStore {
     }
 
     public static func hasPassword(forKey key: String) -> Bool {
-        password(forKey: key) != nil
+        !(password(forKey: key) ?? "").isEmpty
     }
 }

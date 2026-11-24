@@ -11,3 +11,4 @@ DerivedData/
 *.p12
 *.mobileprovision
 dist/
+Vendor/

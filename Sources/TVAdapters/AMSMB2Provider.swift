@@ -146,7 +146,7 @@ public final class AMSMB2Provider: VFSProvider, @unchecked Sendable {
                     if let waitingMsg, !waitingMsg.isEmpty {
                         message = waitingMsg
                     } else {
-                        message = "连接 \(self.host):\(self.port) 超时，请检查 IP 地址、端口及局域网连通性（以及 Apple TV「设置 → 隐私与安全性 → 本地网络」中 AuraTV 权限）"
+                        message = "连接 \(self.host):\(self.port) 超时，请检查 IP 地址、端口及局域网连通性"
                     }
                     self.finish(continuation, result: .failure(VFSError.ioFailure(message)))
                 }
@@ -198,7 +198,7 @@ public final class AMSMB2Provider: VFSProvider, @unchecked Sendable {
         case .posix(let code):
             switch code {
             case .EPERM:
-                return "Apple TV 本地网络权限未开启（EPERM），请到 Apple TV「设置 → 隐私与安全性 → 本地网络」中开启 AuraTV 权限后重试"
+                return "无法建立到 \(host):\(port) 的本地网络连接（POSIX EPERM）"
             case .ECONNREFUSED:
                 return "目标主机 \(host):\(port) 拒绝连接（请确认已开启 SMB 文件共享且防火墙放行 \(port) 端口）"
             case .EHOSTUNREACH, .ENETUNREACH:
@@ -213,28 +213,27 @@ public final class AMSMB2Provider: VFSProvider, @unchecked Sendable {
         }
     }
 
-    private static func extractPOSIXCode(from error: any Error) -> Int32? {
-        if let posix = error as? POSIXError {
-            return Int32(posix.code.rawValue)
-        }
-        let nsError = error as NSError
-        if nsError.domain == NSPOSIXErrorDomain {
-            return Int32(nsError.code)
-        }
-        return nil
-    }
-
-    private static func classifyListSharesError(_ error: any Error) -> VFSError {
+    private static func classifySMBError(_ error: any Error, share: String?) -> VFSError {
         let rawDesc = error.localizedDescription.trimmingCharacters(in: .whitespacesAndNewlines)
-        let code = extractPOSIXCode(from: error)
-        if code == 1 || rawDesc.isEmpty || rawDesc == "Error code 1:" || rawDesc.hasPrefix("Error code 1:") {
-            let label = rawDesc.isEmpty ? "Error code 1" : rawDesc
-            return .ioFailure("SMB 认证或根目录共享枚举被断开（\(label)）。请检查：① 用户名与密码是否正确；② 若服务器限制根目录枚举（IPC$），请点「编辑账号密码」并在「路径 / 共享名」直接填具体共享文件夹名（如 /Movies）；③ 确认 Apple TV「设置 → 隐私与安全性 → 本地网络」已允许 AuraTV。")
+        let label = rawDesc.isEmpty ? "未知 SMB 错误" : rawDesc
+        let upper = label.uppercased()
+
+        if upper.contains("STATUS_LOGON_FAILURE") || upper.contains("0XC000006D") || upper.contains("STATUS_WRONG_PASSWORD") {
+            return .ioFailure("SMB 账号或密码错误（\(label)）。请点「编辑账号密码」核对用户名与密码并重新输入保存。")
         }
-        if code == 13 || rawDesc.localizedCaseInsensitiveContains("ACCESS_DENIED") || rawDesc.localizedCaseInsensitiveContains("LOGON_FAILURE") {
-            return .ioFailure("SMB 账号密码验证失败或无访问权限（\(rawDesc)），请点击「编辑账号密码」核对凭据。")
+        if upper.contains("STATUS_ACCOUNT_RESTRICTION") || upper.contains("0XC000006E") || upper.contains("STATUS_ACCOUNT_LOCKED_OUT") {
+            return .ioFailure("Windows 账号受限（\(label)），请检查服务器账号策略或密码设置。")
         }
-        return .ioFailure("读取根目录共享列表失败：\(rawDesc)")
+        if upper.contains("STATUS_ACCESS_DENIED") || upper.contains("0XC0000022") {
+            return .ioFailure("SMB 权限不足或拒绝访问（\(label)）。请核对账号共享权限，或在「路径 / 共享名」直接填写具体共享名（如 /Movies）。")
+        }
+        if upper.contains("STATUS_BAD_NETWORK_NAME") || upper.contains("0XC00000CC") {
+            return .ioFailure("共享目录不存在（\(label)），请检查「路径 / 共享名」拼写。")
+        }
+        if let share {
+            return .ioFailure("连接共享目录 \(share) 失败：\(label)")
+        }
+        return .ioFailure("读取根目录共享列表失败：\(label)。若服务器限制根目录枚举（IPC$），可点「编辑账号密码」并在「路径 / 共享名」直接填具体共享名（如 /Movies）。")
     }
 
     public func connect() async throws {
@@ -254,8 +253,11 @@ public final class AMSMB2Provider: VFSProvider, @unchecked Sendable {
         let domain: String
         let username: String
         if let slashIndex = rawUser.firstIndex(of: "\\") {
-            domain = String(rawUser[..<slashIndex])
-            username = String(rawUser[rawUser.index(after: slashIndex)...])
+            domain = String(rawUser[..<slashIndex]).trimmingCharacters(in: .whitespacesAndNewlines)
+            username = String(rawUser[rawUser.index(after: slashIndex)...]).trimmingCharacters(in: .whitespacesAndNewlines)
+        } else if let semiIndex = rawUser.firstIndex(of: ";") {
+            domain = String(rawUser[..<semiIndex]).trimmingCharacters(in: .whitespacesAndNewlines)
+            username = String(rawUser[rawUser.index(after: semiIndex)...]).trimmingCharacters(in: .whitespacesAndNewlines)
         } else {
             domain = ""
             username = rawUser
@@ -286,13 +288,7 @@ public final class AMSMB2Provider: VFSProvider, @unchecked Sendable {
         do {
             try await manager.connectShare(name: share)
         } catch {
-            let rawDesc = error.localizedDescription.trimmingCharacters(in: .whitespacesAndNewlines)
-            let code = Self.extractPOSIXCode(from: error)
-            if code == 1 || rawDesc.isEmpty || rawDesc == "Error code 1:" || rawDesc.hasPrefix("Error code 1:") {
-                let label = rawDesc.isEmpty ? "Error code 1" : rawDesc
-                throw VFSError.ioFailure("连接共享目录 \(share) 失败（\(label)）。请检查：① 用户名与密码是否正确；② 共享名称（\(share)）是否存在且当前账号有权限访问；③ Apple TV「设置 → 隐私与安全性 → 本地网络」已开启 AuraTV 权限。")
-            }
-            throw VFSError.ioFailure("连接共享目录 \(share) 失败：\(rawDesc)")
+            throw Self.classifySMBError(error, share: share)
         }
         stateLock.withLock { $0.connectedShare = share }
     }
@@ -354,7 +350,7 @@ public final class AMSMB2Provider: VFSProvider, @unchecked Sendable {
             do {
                 shares = try await manager.listShares()
             } catch {
-                throw Self.classifyListSharesError(error)
+                throw Self.classifySMBError(error, share: nil)
             }
             return shares
                 .filter { !$0.name.hasSuffix("$") }

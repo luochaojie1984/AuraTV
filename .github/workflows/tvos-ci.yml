@@ -25,6 +25,8 @@ jobs:
         run: |
           xcodebuild -version
           xcodebuild -showsdks | grep appletvos
+      - name: Prepare patched AMSMB2 dependency
+        run: bash scripts/prepare_amsmb2.sh --patch-project-yml
       - name: Install XcodeGen
         run: brew install xcodegen
       - name: Generate Xcode Project
@@ -67,6 +69,8 @@ jobs:
     runs-on: xcode-27
     steps:
       - uses: actions/checkout@v4
+      - name: Prepare patched AMSMB2 dependency
+        run: bash scripts/prepare_amsmb2.sh --patch-project-yml
       - name: Install XcodeGen & Generate Simulator Project (exclude device-only KSPlayer)
         run: |
           brew install xcodegen

@@ -149,8 +149,14 @@ struct FileBrowserView: View {
                 }
             }
 
-            Toggle("仅视频", isOn: $onlyVideos)
-                .frame(width: 190)
+            Button {
+                onlyVideos.toggle()
+            } label: {
+                Label(onlyVideos ? "仅视频" : "全部文件", systemImage: onlyVideos ? "film.fill" : "square.grid.2x2")
+                    .lineLimit(1)
+            }
+            .buttonStyle(.bordered)
+            .tint(onlyVideos ? TVTheme.accent : nil)
         }
         .padding(.horizontal, TVMetrics.horizontalSafeMargin)
         .padding(.vertical, 26)
@@ -174,7 +180,10 @@ struct FileBrowserView: View {
     }
 
     private func errorView(_ errorText: String) -> some View {
-        VStack {
+        let accountDesc = activeSource.username.isEmpty
+            ? "访客登录"
+            : "账号 \(activeSource.username)（\(KeychainCredentialStore.hasPassword(forKey: activeSource.credentialKey) ? "已存密码" : "未存密码")）"
+        return VStack {
             Spacer()
             VStack(alignment: .leading, spacing: 22) {
                 HStack(spacing: 14) {
@@ -185,7 +194,7 @@ struct FileBrowserView: View {
                         Text("无法读取目录")
                             .font(.system(size: 30, weight: .bold))
                             .foregroundStyle(.white)
-                        Text("\(activeSource.protocolType.rawValue.uppercased()) · \(activeSource.host)\(activeSource.port.map { ":\($0)" } ?? "") · 路径 \(activeSource.basePath)")
+                        Text("\(activeSource.protocolType.rawValue.uppercased()) · \(activeSource.host)\(activeSource.port.map { ":\($0)" } ?? "") · 路径 \(activeSource.basePath) · \(accountDesc)")
                             .font(.system(size: 18))
                             .foregroundStyle(TVTheme.secondaryText)
                     }
