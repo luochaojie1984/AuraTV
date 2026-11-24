@@ -35,7 +35,6 @@ targets:
         embed: true
       - package: KSPlayer
         product: KSPlayer
-        embed: true
       - package: KSPlayer
         product: KSPlayerUI
     info:
