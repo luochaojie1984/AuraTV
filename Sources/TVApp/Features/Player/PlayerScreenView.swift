@@ -35,7 +35,10 @@ struct PlayerScreenView: View {
     @StateObject private var engine = PlaybackCoordinator()
     @StateObject private var scrub = MXScrubController()
 
+    @State private var scrubEngine = LiveKeyframeScrubEngine()
+    @State private var scrubPrepareTask: Task<Void, Never>?
     @State private var provider: (any VFSProvider)?
+    @State private var activeStreamToken: String?
     @State private var activeStreamURL: URL?
     @State private var enginePreference: PreferredEngineChoice = .auto
     @State private var subtitleTrack: ParsedSubtitleTrack?
@@ -50,6 +53,7 @@ struct PlayerScreenView: View {
     @State private var loadError: String?
     @State private var hudHideTask: Task<Void, Never>?
     @State private var lastReportedSecond: Int = -1
+    @State private var didShutdown: Bool = false
 
     private var style: SubtitleStyleConfig { env.settings.subtitleStyle }
     private var anyDrawerOpen: Bool { showSubtitleDrawer || showAudioDrawer }
@@ -71,17 +75,29 @@ struct PlayerScreenView: View {
                 .ignoresSafeArea()
             #endif
 
+            // Full-screen hardware-decoded live keyframe overlay during multi-stage shuttle / hold / touchpad scrub.
+            // Retained until the main player completes its resume seek -> zero black flash!
+            if let previewCG = scrub.previewImage {
+                Image(decorative: previewCG, scale: 1.0)
+                    .resizable()
+                    .aspectRatio(contentMode: .fit)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    .background(Color.black)
+                    .ignoresSafeArea()
+            }
+
             SubtitleOverlayView(
                 track: subtitleTrack ?? ParsedSubtitleTrack(cues: [], format: "empty"),
                 style: style,
-                currentTime: engine.currentTime
+                currentTime: (scrub.isScrubbing || scrub.isCommitting) ? scrub.displayedFrameTime : engine.currentTime
             )
             .ignoresSafeArea()
 
             RemoteKeyCaptureView(
                 isCaptureEnabled: !showHUD && !anyDrawerOpen && loadError == nil,
+                enableTouchpadScrub: env.settings.enableTouchpadScrub,
                 onShortPress: { dir in
-                    Task { await shortSeek(dir) }
+                    handleShortPress(dir)
                 },
                 onLongPressBegan: { dir in
                     beginLongHold(dir)
@@ -89,15 +105,43 @@ struct PlayerScreenView: View {
                 onLongPressEnded: {
                     endLongHold()
                 },
+                onTouchpadPanBegan: {
+                    beginTouchpadScrub()
+                },
+                onTouchpadPanChanged: { dx, vel in
+                    scrub.updateTouchpadPan(deltaPoints: dx, velocityPointsPerSec: vel)
+                },
+                onTouchpadPanEnded: {
+                    endTouchpadScrub()
+                },
+                onSelectPress: {
+                    if scrub.isScrubbing {
+                        commitActiveScrub()
+                    } else {
+                        showHUD = true
+                        scheduleHUDHide()
+                    }
+                },
                 onShowHUD: {
+                    if scrub.isScrubbing {
+                        commitActiveScrub()
+                    }
                     showHUD = true
                     scheduleHUDHide()
                 },
                 onPlayPause: {
-                    togglePlayback()
+                    if scrub.isScrubbing {
+                        commitActiveScrub()
+                    } else {
+                        togglePlayback()
+                    }
                 },
                 onMenu: {
-                    shutdown()
+                    if scrub.isScrubbing {
+                        commitActiveScrub()
+                    } else {
+                        shutdown()
+                    }
                 }
             )
             .ignoresSafeArea()
@@ -239,7 +283,9 @@ struct PlayerScreenView: View {
             persistProgress(newValue)
         }
         .onExitCommand {
-            if showSubtitleDrawer {
+            if scrub.isScrubbing {
+                commitActiveScrub()
+            } else if showSubtitleDrawer {
                 showSubtitleDrawer = false
             } else if showAudioDrawer {
                 showAudioDrawer = false
@@ -277,32 +323,65 @@ struct PlayerScreenView: View {
     }
 
     private var scrubPill: some View {
+        let isForward: Bool = {
+            switch scrub.activeMode {
+            case .shuttle(let g): return g >= 0
+            case .hold(let dir, _): return dir == .forward
+            case .touchpad, .idle: return scrub.deltaSeconds >= 0
+            }
+        }()
         let sign = scrub.deltaSeconds >= 0 ? "+" : "-"
-        let arrow = scrub.deltaSeconds >= 0 ? ">>>" : "<<<"
-        return VStack(spacing: 8) {
-            HStack(spacing: 14) {
-                Text(arrow).foregroundStyle(TVTheme.accent)
+        let arrow = isForward ? ">>>" : "<<<"
+
+        return VStack(spacing: 10) {
+            HStack(spacing: 16) {
+                Text(arrow)
+                    .foregroundStyle(TVTheme.accent)
+
+                if !scrub.speedBadgeText.isEmpty {
+                    Text(scrub.speedBadgeText)
+                        .font(.system(size: 20, weight: .heavy, design: .monospaced))
+                        .foregroundStyle(.black)
+                        .padding(.horizontal, 12)
+                        .padding(.vertical, 4)
+                        .background(TVTheme.accent, in: Capsule())
+                }
+
                 Text("\(sign)\(formatTime(abs(scrub.deltaSeconds)))")
                     .foregroundStyle(TVTheme.accent)
-                Text("|").foregroundStyle(TVTheme.tertiaryText)
+
+                Text("|")
+                    .foregroundStyle(TVTheme.tertiaryText)
+
                 Text("\(formatTime(scrub.targetTime)) / \(formatTime(engine.duration))")
             }
             .font(.system(size: 24, weight: .bold, design: .monospaced))
 
             GeometryReader { proxy in
                 let ratio = engine.duration > 0 ? min(max(scrub.targetTime / engine.duration, 0), 1) : 0
+                let fillWidth = max(0, proxy.size.width * ratio)
                 ZStack(alignment: .leading) {
-                    Capsule().fill(Color.white.opacity(0.18))
+                    Capsule().fill(Color.white.opacity(0.20))
                     Capsule()
                         .fill(TVTheme.accent)
-                        .frame(width: max(0, proxy.size.width * ratio))
+                        .frame(width: fillWidth)
+                    Circle()
+                        .fill(Color.white)
+                        .frame(width: 14, height: 14)
+                        .offset(x: max(0, min(proxy.size.width - 14, fillWidth - 7)))
                 }
             }
-            .frame(width: 420, height: 6)
+            .frame(width: 540, height: 8)
+
+            if !scrub.hintText.isEmpty {
+                Text(scrub.hintText)
+                    .font(.system(size: 16, weight: .medium))
+                    .foregroundStyle(TVTheme.secondaryText)
+            }
         }
-        .padding(.horizontal, 26)
-        .padding(.vertical, 14)
-        .tvGlassSurface(cornerRadius: 20)
+        .padding(.horizontal, 30)
+        .padding(.vertical, 16)
+        .tvGlassSurface(cornerRadius: 22)
         .padding(.bottom, 16)
     }
 
@@ -335,6 +414,7 @@ struct PlayerScreenView: View {
                 wrapWithReadAheadCache: true,
                 cacheConfig: cacheConfig
             )
+            self.activeStreamToken = registered.token
             self.activeStreamURL = registered.url
             try await engine.load(
                 url: registered.url,
@@ -347,6 +427,13 @@ struct PlayerScreenView: View {
                     refreshRate: Float(engine.currentStats().frameRate),
                     formatDescription: engine.avAdapter.videoFormatDescription
                 )
+            }
+            // Warm up dedicated hardware keyframe scrub engine in background (hits pinned RAM headers in <15ms)
+            let localScrub = scrubEngine
+            let streamURL = registered.url
+            scrubPrepareTask?.cancel()
+            scrubPrepareTask = Task.detached(priority: .utility) {
+                await localScrub.prepare(url: streamURL)
             }
             scheduleHUDHide()
             await loadSubtitles(provider: newProvider)
@@ -422,6 +509,66 @@ struct PlayerScreenView: View {
         scheduleHUDHide()
     }
 
+    // MARK: - 3-in-1 MX Live Scrub Controls
+
+    private func makePreviewFrameLoader() -> MXScrubController.PreviewFrameLoader {
+        let localScrubEngine = scrubEngine
+        let localEngine = engine
+        return { target in
+            if let frame = await localScrubEngine.decodePreviewFrame(at: target) {
+                return frame
+            }
+            // Fallback when LiveKeyframeScrubEngine is still initializing or codec unsupported
+            await localEngine.seekToKeyframePreview(at: target)
+            return nil
+        }
+    }
+
+    private func enterScrubHardwareStateIfNeeded() {
+        hudHideTask?.cancel()
+        showHUD = false
+        shortSeekNotice = nil
+        guard !scrub.isScrubbing else { return }
+        if let token = activeStreamToken {
+            env.proxy.setScrubMode(true, for: token)
+        }
+        engine.pause()
+        engine.setMuted(true)
+    }
+
+    private func commitActiveScrub() {
+        let token = activeStreamToken
+        scrub.commit { finalTarget in
+            if let token {
+                env.proxy.setScrubMode(false, for: token)
+            }
+            await engine.seek(to: finalTarget, precise: true)
+            engine.setMuted(false)
+            engine.play()
+        }
+    }
+
+    private func handleShortPress(_ direction: ScrubDirection) {
+        if env.settings.shortPressSeekBehavior == .multiStageShuttle {
+            enterScrubHardwareStateIfNeeded()
+            let result = scrub.stepShuttle(
+                direction: direction,
+                currentPlaybackTime: engine.currentTime,
+                duration: engine.duration,
+                onPreviewFrame: makePreviewFrameLoader()
+            )
+            if case .exitedToNormalPlayback = result {
+                commitActiveScrub()
+            }
+        } else {
+            if scrub.isScrubbing {
+                commitActiveScrub()
+            } else {
+                Task { await shortSeek(direction) }
+            }
+        }
+    }
+
     private func shortSeek(_ direction: ScrubDirection) async {
         let stepSeconds = Int(env.settings.shortSeekSeconds)
         let step = env.settings.shortSeekSeconds * Double(direction.rawValue)
@@ -439,7 +586,7 @@ struct PlayerScreenView: View {
     private func beginLongHold(_ direction: ScrubDirection) {
         hudHideTask?.cancel()
         showHUD = false
-        if env.settings.longPressSeekMode == .continuousFastPlay && direction == .forward {
+        if env.settings.longPressSeekMode == .continuousFastPlay && direction == .forward && !scrub.isScrubbing {
             isFastPlaying = true
             fastPlayDirection = direction
             engine.setPlaybackRate(3.0)
@@ -447,15 +594,13 @@ struct PlayerScreenView: View {
             return
         }
 
-        engine.pause()
-        engine.setMuted(true)
+        enterScrubHardwareStateIfNeeded()
         scrub.beginHold(
             direction: direction,
             currentPlaybackTime: engine.currentTime,
-            duration: engine.duration
-        ) { target in
-            await engine.seekToKeyframePreview(at: target)
-        }
+            duration: engine.duration,
+            onPreviewFrame: makePreviewFrameLoader()
+        )
     }
 
     private func endLongHold() {
@@ -464,10 +609,23 @@ struct PlayerScreenView: View {
             engine.setPlaybackRate(1.0)
             return
         }
-        scrub.endHold { target in
-            await engine.seek(to: target, precise: true)
-            engine.setMuted(false)
-            engine.play()
+        if scrub.isScrubbing {
+            commitActiveScrub()
+        }
+    }
+
+    private func beginTouchpadScrub() {
+        enterScrubHardwareStateIfNeeded()
+        scrub.beginTouchpadPan(
+            currentPlaybackTime: engine.currentTime,
+            duration: engine.duration,
+            onPreviewFrame: makePreviewFrameLoader()
+        )
+    }
+
+    private func endTouchpadScrub() {
+        if scrub.isScrubbing {
+            commitActiveScrub()
         }
     }
 
@@ -499,7 +657,18 @@ struct PlayerScreenView: View {
     }
 
     private func shutdown() {
+        guard !didShutdown else { return }
+        didShutdown = true
         hudHideTask?.cancel()
+        scrubPrepareTask?.cancel()
+        scrub.cancelAll()
+        if let token = activeStreamToken {
+            env.proxy.setScrubMode(false, for: token)
+            env.proxy.unregister(token: token)
+            activeStreamToken = nil
+        }
+        let localScrub = scrubEngine
+        Task { await localScrub.close() }
         engine.shutdown()
         DisplayModeCoordinator.shared.reset()
         if let provider {

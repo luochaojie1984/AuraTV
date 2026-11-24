@@ -7,34 +7,50 @@ public enum ScrubDirection: Int, Sendable {
     case backward = -1
 }
 
-/// tvOS 正统焦点按键捕获视图：
-/// - 当 `isCaptureEnabled == true`（全屏无 HUD / 抽屉关闭）时，`canBecomeFocused = true` 并主动抢占焦点，
-///   在 tvOS 上聚焦的 UIView 100% 必然收到 Siri Remote 左/右键的 `pressesBegan` 与 `pressesEnded`，
-///   精准区分短按 (<220ms) 与长按 (≥220ms)。
-/// - 当 `isCaptureEnabled == false`（HUD 或抽屉弹出）时，`canBecomeFocused = false`，
-///   将全部方向键无缝交还给 SwiftUI Focus Engine 操作按钮与滑块。
+/// tvOS 正统焦点按键 + Siri Remote 触控板手势捕获视图：
+/// - `isCaptureEnabled == true`（全屏播放且无 HUD/抽屉）时主动持有焦点，精准捕获：
+///   1. 左/右键短按 (<220ms) → 触发多级实时快进/快退（或定长跳秒）
+///   2. 左/右键长按 (≥220ms) → 触发 MX 无级实时快进/快退，松手即恢复
+///   3. Siri Remote 触控板左右划动（48pt 防误触死区 + 水平主方向判定）→ 仿安卓 MX Player 拇指实时滑屏
+///   4. 确认键 (Select) / 播放暂停键 / 返回键 (Menu) → 快进中直接定格并从当前画面恢复播放
+/// - `isCaptureEnabled == false`（HUD 或抽屉打开）时释放焦点与手势，交还 SwiftUI Focus Engine。
 public struct RemoteKeyCaptureView: UIViewControllerRepresentable {
     public var isCaptureEnabled: Bool
+    public var enableTouchpadScrub: Bool
     public var onShortPress: (ScrubDirection) -> Void
     public var onLongPressBegan: (ScrubDirection) -> Void
     public var onLongPressEnded: () -> Void
+    public var onTouchpadPanBegan: () -> Void
+    public var onTouchpadPanChanged: (_ deltaPoints: CGFloat, _ velocityPointsPerSec: CGFloat) -> Void
+    public var onTouchpadPanEnded: () -> Void
+    public var onSelectPress: () -> Void
     public var onShowHUD: () -> Void
     public var onPlayPause: () -> Void
     public var onMenu: () -> Void
 
     public init(
         isCaptureEnabled: Bool,
+        enableTouchpadScrub: Bool = true,
         onShortPress: @escaping (ScrubDirection) -> Void,
         onLongPressBegan: @escaping (ScrubDirection) -> Void,
         onLongPressEnded: @escaping () -> Void,
+        onTouchpadPanBegan: @escaping () -> Void = {},
+        onTouchpadPanChanged: @escaping (_ deltaPoints: CGFloat, _ velocityPointsPerSec: CGFloat) -> Void = { _, _ in },
+        onTouchpadPanEnded: @escaping () -> Void = {},
+        onSelectPress: @escaping () -> Void = {},
         onShowHUD: @escaping () -> Void,
         onPlayPause: @escaping () -> Void,
         onMenu: @escaping () -> Void
     ) {
         self.isCaptureEnabled = isCaptureEnabled
+        self.enableTouchpadScrub = enableTouchpadScrub
         self.onShortPress = onShortPress
         self.onLongPressBegan = onLongPressBegan
         self.onLongPressEnded = onLongPressEnded
+        self.onTouchpadPanBegan = onTouchpadPanBegan
+        self.onTouchpadPanChanged = onTouchpadPanChanged
+        self.onTouchpadPanEnded = onTouchpadPanEnded
+        self.onSelectPress = onSelectPress
         self.onShowHUD = onShowHUD
         self.onPlayPause = onPlayPause
         self.onMenu = onMenu
@@ -43,13 +59,13 @@ public struct RemoteKeyCaptureView: UIViewControllerRepresentable {
     public func makeUIViewController(context: Context) -> KeyCaptureViewController {
         let vc = KeyCaptureViewController()
         vc.coordinator = context.coordinator
-        vc.setCaptureEnabled(isCaptureEnabled)
+        vc.setCaptureEnabled(isCaptureEnabled, touchpadEnabled: enableTouchpadScrub)
         return vc
     }
 
     public func updateUIViewController(_ uiViewController: KeyCaptureViewController, context: Context) {
         context.coordinator.parent = self
-        uiViewController.setCaptureEnabled(isCaptureEnabled)
+        uiViewController.setCaptureEnabled(isCaptureEnabled, touchpadEnabled: enableTouchpadScrub)
     }
 
     public func makeCoordinator() -> Coordinator { Coordinator(parent: self) }
@@ -73,9 +89,24 @@ public struct RemoteKeyCaptureView: UIViewControllerRepresentable {
         private var didTriggerLongPress: Bool = false
         private let longPressThreshold: TimeInterval = 0.22 // 220ms 判定为长按
 
+        // Siri Remote touchpad pan scrub state
+        private var panGesture: UIPanGestureRecognizer?
+        private var isTouchpadScrubbing: Bool = false
+        private var lastPanX: CGFloat = 0
+        private let panActivationDeadzone: CGFloat = 48.0
+
         public override func loadView() {
             captureView.backgroundColor = .clear
             self.view = captureView
+        }
+
+        public override func viewDidLoad() {
+            super.viewDidLoad()
+            let pan = UIPanGestureRecognizer(target: self, action: #selector(handleTouchpadPan(_:)))
+            pan.allowedTouchTypes = [NSNumber(value: UITouch.TouchType.indirect.rawValue)]
+            pan.cancelsTouchesInView = false
+            captureView.addGestureRecognizer(pan)
+            self.panGesture = pan
         }
 
         public override var preferredFocusEnvironments: [UIFocusEnvironment] {
@@ -87,15 +118,21 @@ public struct RemoteKeyCaptureView: UIViewControllerRepresentable {
             requestFocusIfEnabled()
         }
 
-        func setCaptureEnabled(_ enabled: Bool) {
+        func setCaptureEnabled(_ enabled: Bool, touchpadEnabled: Bool) {
             let changed = (captureView.captureActive != enabled)
             captureView.captureActive = enabled
             captureView.isUserInteractionEnabled = enabled
+            panGesture?.isEnabled = enabled && touchpadEnabled
+
             if !enabled {
                 holdTimer?.invalidate()
                 holdTimer = nil
                 activeDirection = nil
                 didTriggerLongPress = false
+                if isTouchpadScrubbing {
+                    isTouchpadScrubbing = false
+                    coordinator?.parent.onTouchpadPanEnded()
+                }
             } else if changed {
                 requestFocusIfEnabled()
             }
@@ -108,11 +145,60 @@ public struct RemoteKeyCaptureView: UIViewControllerRepresentable {
             updateFocusIfNeeded()
         }
 
+        @objc private func handleTouchpadPan(_ gesture: UIPanGestureRecognizer) {
+            guard captureView.captureActive,
+                  coordinator?.parent.enableTouchpadScrub == true,
+                  activeDirection == nil else {
+                return
+            }
+
+            switch gesture.state {
+            case .began:
+                isTouchpadScrubbing = false
+                lastPanX = 0
+
+            case .changed:
+                let translation = gesture.translation(in: captureView)
+                let velocity = gesture.velocity(in: captureView)
+
+                if !isTouchpadScrubbing {
+                    // Require clear horizontal intent beyond 48pt deadzone to avoid accidental thumb rest
+                    if abs(translation.x) >= panActivationDeadzone && abs(translation.x) > abs(translation.y) * 1.4 {
+                        isTouchpadScrubbing = true
+                        lastPanX = translation.x
+                        coordinator?.parent.onTouchpadPanBegan()
+                    }
+                } else {
+                    let dx = translation.x - lastPanX
+                    lastPanX = translation.x
+                    if abs(dx) > 0.25 {
+                        coordinator?.parent.onTouchpadPanChanged(dx, velocity.x)
+                    }
+                }
+
+            case .ended, .cancelled, .failed:
+                if isTouchpadScrubbing {
+                    isTouchpadScrubbing = false
+                    coordinator?.parent.onTouchpadPanEnded()
+                }
+
+            default:
+                break
+            }
+        }
+
         public override func pressesBegan(_ presses: Set<UIPress>, with event: UIPressesEvent?) {
             guard captureView.captureActive, let press = presses.first else {
                 super.pressesBegan(presses, with: event)
                 return
             }
+
+            // If user clicks a physical button while thumb is still resting on touchpad, finish pan cleanly
+            if isTouchpadScrubbing {
+                isTouchpadScrubbing = false
+                coordinator?.parent.onTouchpadPanEnded()
+            }
+
             switch press.type {
             case .rightArrow, .leftArrow:
                 let dir: ScrubDirection = (press.type == .rightArrow) ? .forward : .backward
@@ -126,7 +212,9 @@ public struct RemoteKeyCaptureView: UIViewControllerRepresentable {
                         self.coordinator?.parent.onLongPressBegan(d)
                     }
                 }
-            case .upArrow, .downArrow, .select:
+            case .select:
+                coordinator?.parent.onSelectPress()
+            case .upArrow, .downArrow:
                 coordinator?.parent.onShowHUD()
             case .playPause:
                 coordinator?.parent.onPlayPause()

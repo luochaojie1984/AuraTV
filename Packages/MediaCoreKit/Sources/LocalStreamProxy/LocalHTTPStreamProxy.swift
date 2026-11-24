@@ -45,6 +45,7 @@ public final class LocalHTTPStreamProxy: @unchecked Sendable {
     private var listenFD: Int32 = -1
     private var isRunning: Bool = false
     private var streams: [String: RegisteredStreamEntry] = [:]
+    private var scrubTokens: Set<String> = []
 
     public init() {}
 
@@ -125,6 +126,7 @@ public final class LocalHTTPStreamProxy: @unchecked Sendable {
         isRunning = false
         let existingStreams = streams
         streams.removeAll()
+        scrubTokens.removeAll()
         port = 0
         lock.unlock()
 
@@ -176,9 +178,34 @@ public final class LocalHTTPStreamProxy: @unchecked Sendable {
         return (token, url)
     }
 
+    /// Toggles low-latency scrub bypass on the underlying ReadAheadStreamCache so
+    /// keyframe reads fetch exact small slices (~128-256KB) instead of 2MB chunks.
+    public func setScrubMode(_ enabled: Bool, for token: String) {
+        lock.lock()
+        if enabled {
+            scrubTokens.insert(token)
+        } else {
+            scrubTokens.remove(token)
+        }
+        let entry = streams[token]
+        lock.unlock()
+        if let cache = entry?.stream as? ReadAheadStreamCache {
+            Task {
+                await cache.setScrubBypass(enabled)
+            }
+        }
+    }
+
+    private func isScrubMode(token: String) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return scrubTokens.contains(token)
+    }
+
     public func unregister(token: String) {
         lock.lock()
         let removed = streams.removeValue(forKey: token)
+        scrubTokens.remove(token)
         lock.unlock()
         if let removed {
             Task { await removed.stream.close() }
@@ -297,11 +324,12 @@ public final class LocalHTTPStreamProxy: @unchecked Sendable {
         )
         guard sendAll(fd: fd, data: headerData) else { return }
 
-        // Stream requested byte range in 256 KB slices; abort cleanly if client disconnects
-        let sliceSize = 256 * 1024
+        // Stream requested byte range in 128 KB slices during MX live scrub (minimal latency)
+        // or 256 KB slices during normal sequential playback; abort cleanly if client disconnects.
         var cursor = byteRange.lowerBound
         while cursor <= byteRange.upperBound {
             if Task.isCancelled || !checkRunning() { break }
+            let sliceSize = isScrubMode(token: tokenKey) ? (128 * 1024) : (256 * 1024)
             let remaining = byteRange.upperBound - cursor + 1
             let toRead = Int(min(Int64(sliceSize), remaining))
             do {

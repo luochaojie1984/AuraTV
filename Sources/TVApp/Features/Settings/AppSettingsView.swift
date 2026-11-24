@@ -11,19 +11,33 @@ struct AppSettingsView: View {
                 Text("设置")
                     .font(.system(size: 44, weight: .heavy))
 
-                group("快进") {
+                group("快进与快退（MX 实时出画引擎）") {
                     optionRow(
-                        title: "短按步长",
-                        options: [5.0, 10.0, 15.0, 30.0].map { "\(Int($0))s" },
-                        selectedIndex: [5.0, 10.0, 15.0, 30.0].firstIndex(of: env.settings.shortSeekSeconds) ?? 1
+                        title: "短按左/右键",
+                        options: ["多级实时加速 4x~64x (推荐)", "定长跳秒"],
+                        selectedIndex: env.settings.shortPressSeekBehavior == .multiStageShuttle ? 0 : 1
                     ) { index in
-                        let values: [Double] = [5, 10, 15, 30]
-                        Task { await env.updateSettings { $0.shortSeekSeconds = values[index] } }
+                        Task {
+                            await env.updateSettings {
+                                $0.shortPressSeekBehavior = index == 0 ? .multiStageShuttle : .fixedStepJump
+                            }
+                        }
+                    }
+
+                    if env.settings.shortPressSeekBehavior == .fixedStepJump {
+                        optionRow(
+                            title: "定长跳秒步长",
+                            options: [5.0, 10.0, 15.0, 30.0].map { "\(Int($0))s" },
+                            selectedIndex: [5.0, 10.0, 15.0, 30.0].firstIndex(of: env.settings.shortSeekSeconds) ?? 1
+                        ) { index in
+                            let values: [Double] = [5, 10, 15, 30]
+                            Task { await env.updateSettings { $0.shortSeekSeconds = values[index] } }
+                        }
                     }
 
                     optionRow(
-                        title: "长按行为",
-                        options: ["MX 实时跳帧", "连续倍速"],
+                        title: "长按左/右键",
+                        options: ["MX 实时出画 12x~150x (推荐)", "连续 3x 倍速"],
                         selectedIndex: env.settings.longPressSeekMode == .mxLiveKeyframeScrub ? 0 : 1
                     ) { index in
                         Task {
@@ -32,6 +46,22 @@ struct AppSettingsView: View {
                             }
                         }
                     }
+
+                    optionRow(
+                        title: "触控板左右划屏",
+                        options: ["开启 (推荐)", "关闭"],
+                        selectedIndex: env.settings.enableTouchpadScrub ? 0 : 1
+                    ) { index in
+                        Task {
+                            await env.updateSettings {
+                                $0.enableTouchpadScrub = (index == 0)
+                            }
+                        }
+                    }
+
+                    Text("三种快进方式均由独立硬解抽帧引擎实时驱动全屏画面同步变化：点按右键 4x→8x→16x→32x→64x（左键降档或倒退），按确认/播放键立刻定格恢复；长按方向键极速推进松手即播；Siri Remote 触控板大拇指左右划屏直接拖帧。")
+                        .font(.system(size: 16))
+                        .foregroundStyle(TVTheme.tertiaryText)
                 }
 
                 group("缓存") {
@@ -43,7 +73,7 @@ struct AppSettingsView: View {
                         let values = [64, 96, 128, 160, 192]
                         Task { await env.updateSettings { $0.readAheadCacheLimitMB = values[index] } }
                     }
-                    Text("Apple TV 内存上限硬约束 192 MB，超出会被系统 Jetsam 杀掉。")
+                    Text("Apple TV 内存上限硬约束 192 MB，超出会被系统 Jetsam 杀掉。快进时会自动启用直通模式跳过 2MB 分块预读以压缩出画延迟。")
                         .font(.system(size: 16))
                         .foregroundStyle(TVTheme.tertiaryText)
                 }

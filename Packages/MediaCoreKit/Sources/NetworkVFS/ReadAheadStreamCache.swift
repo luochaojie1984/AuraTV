@@ -29,6 +29,7 @@ public struct StreamCacheMetrics: Sendable, Equatable {
     public let cacheHits: Int
     public let cacheMisses: Int
     public let cancelledPrefetches: Int
+    public let directScrubReads: Int
 }
 
 /// Sliding-window read-ahead chunk cache with permanent head/tail index pinning
@@ -45,6 +46,10 @@ public actor ReadAheadStreamCache: VFSRandomAccessStream {
     private var prefetchTasks: [Int64: Task<Void, Never>] = [:]
     private var lastReadEndOffset: Int64 = 0
     private var isClosed: Bool = false
+    /// When true (during MX live scrubbing / multi-gear fast-forward), bypass 2MB chunk rounding
+    /// for middle-of-file keyframe reads while still serving pinned head/tail index blocks from RAM!
+    private var scrubBypassEnabled: Bool = false
+    private var directScrubReads: Int = 0
 
     private var cacheHits: Int = 0
     private var cacheMisses: Int = 0
@@ -76,16 +81,30 @@ public actor ReadAheadStreamCache: VFSRandomAccessStream {
             return Data()
         }
 
-        // Large random seek detected -> immediately cancel stale read-ahead tasks
-        if abs(offset - lastReadEndOffset) > config.largeSeekThresholdBytes {
-            cancelAllPrefetches()
-        }
-
         let clampedEnd = min(totalSize, offset + Int64(length))
         let bytesNeeded = Int(clampedEnd - offset)
         let cs = Int64(config.chunkSize)
         let firstChunk = offset / cs
         let lastChunk = (clampedEnd - 1) / cs
+
+        // Scrub-Bypass Fast Path:
+        // If already in RAM (e.g., pinned head/tail MKV Cues / MP4 moov), serve from cache in 0.01ms.
+        // Otherwise bypass 2MB chunk alignment & prefetches and fetch ONLY the exact keyframe slice!
+        if scrubBypassEnabled {
+            let allCached = (firstChunk...lastChunk).allSatisfy { chunks[$0] != nil }
+            if !allCached {
+                directScrubReads += 1
+                try Task.checkCancellation()
+                return try await upstream.read(offset: offset, length: bytesNeeded)
+            }
+        }
+
+        // Large random seek detected -> immediately cancel stale read-ahead tasks
+        if abs(offset - lastReadEndOffset) > config.largeSeekThresholdBytes {
+            cancelAllPrefetches()
+        }
+
+
 
         var result = Data()
         result.reserveCapacity(bytesNeeded)
@@ -103,7 +122,9 @@ public actor ReadAheadStreamCache: VFSRandomAccessStream {
         }
 
         lastReadEndOffset = offset + Int64(result.count)
-        schedulePrefetch(after: lastChunk)
+        if !scrubBypassEnabled {
+            schedulePrefetch(after: lastChunk)
+        }
         return result
     }
 
@@ -120,13 +141,21 @@ public actor ReadAheadStreamCache: VFSRandomAccessStream {
         await upstream.close()
     }
 
+    public func setScrubBypass(_ enabled: Bool) {
+        scrubBypassEnabled = enabled
+        if enabled {
+            cancelAllPrefetches()
+        }
+    }
+
     public func metrics() -> StreamCacheMetrics {
         StreamCacheMetrics(
             cachedChunkCount: chunks.count,
             cachedBytes: currentCachedBytes,
             cacheHits: cacheHits,
             cacheMisses: cacheMisses,
-            cancelledPrefetches: cancelledPrefetches
+            cancelledPrefetches: cancelledPrefetches,
+            directScrubReads: directScrubReads
         )
     }
 

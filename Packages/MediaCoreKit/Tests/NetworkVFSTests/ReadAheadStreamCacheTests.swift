@@ -96,4 +96,36 @@ final class ReadAheadStreamCacheTests: XCTestCase {
 
         await cache.close()
     }
+
+    func testScrubBypassServesPinnedHeadFromRAMAndBypassesChunkRoundingInBody() async throws {
+        let chunkSize = 64 * 1024
+        let size = chunkSize * 8
+        let upstream = MockMemoryStream(sizeBytes: size)
+        let config = StreamCacheConfiguration(
+            chunkSize: chunkSize,
+            maxCacheBytes: chunkSize * 4,
+            readAheadChunkCount: 2,
+            protectedEdgeBytes: chunkSize,
+            largeSeekThresholdBytes: Int64(chunkSize * 2)
+        )
+        let cache = ReadAheadStreamCache(upstream: upstream, config: config)
+
+        // Pin head chunk 0 in RAM
+        _ = try await cache.read(offset: 0, length: 4096)
+        await cache.setScrubBypass(true)
+
+        // Head index read hits RAM (not a directScrubRead)
+        let head = try await cache.read(offset: 1024, length: 2048)
+        XCTAssertEqual(head, Data(upstream.buffer[1024..<3072]))
+
+        // Middle uncached keyframe read bypasses 64KB chunking and fetches exact 12KB slice
+        let keyframe = try await cache.read(offset: Int64(chunkSize * 4 + 500), length: 12_000)
+        XCTAssertEqual(keyframe, Data(upstream.buffer[(chunkSize * 4 + 500)..<(chunkSize * 4 + 12_500)]))
+
+        let metrics = await cache.metrics()
+        XCTAssertEqual(metrics.directScrubReads, 1)
+        let middleCached = await cache.isChunkCached(4)
+        XCTAssertFalse(middleCached, "Scrub bypass must not wastefully populate 2MB cache chunks")
+        await cache.close()
+    }
 }
