@@ -150,9 +150,6 @@ struct PlayerScreenView: View {
                         onStyleChange: { mutate in
                             Task { await env.updateSubtitleStyle(mutate) }
                         },
-                        onClearSubtitle: {
-                            subtitleTrack = nil
-                        },
                         onClose: {
                             showSubtitleDrawer = false
                         }
@@ -303,14 +300,16 @@ struct PlayerScreenView: View {
 
     private func startPlayback() async {
         do {
-            let newProvider = try env.makeProvider(for: request.source)
+            guard let newProvider = env.makeProvider(for: request.source) else {
+                throw VFSError.invalidURL(request.source.host)
+            }
             self.provider = newProvider
             try await newProvider.connect()
             let stream = try await newProvider.openStream(at: request.item.path)
             let cacheConfig = StreamCacheConfiguration(
                 maxCacheBytes: env.settings.readAheadCacheLimitMB * 1024 * 1024
             )
-            let registered = try env.streamProxy.register(
+            let registered = try env.proxy.register(
                 stream: stream,
                 fileName: request.item.name,
                 wrapWithReadAheadCache: true,
