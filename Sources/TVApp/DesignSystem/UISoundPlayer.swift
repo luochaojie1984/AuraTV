@@ -3,7 +3,8 @@ import AVFoundation
 import QuartzCore
 
 /// Low-latency preloaded UI sound effect player for tvOS navigation.
-/// Uses `.ambient` audio session with `.mixWithOthers` so video/music playback is NEVER interrupted.
+/// Carefully respects active `.playback` sessions (Dolby Atmos / surround HDMI output)
+/// and only sets `.ambient` + `.mixWithOthers` when no video playback session is active.
 @MainActor
 public final class UISoundPlayer {
     public static let shared = UISoundPlayer()
@@ -16,7 +17,6 @@ public final class UISoundPlayer {
 
     private var pools: [SoundKind: [AVAudioPlayer]] = [:]
     private var poolIndex: [SoundKind: Int] = [:]
-    private var sessionConfigured = false
     private var lastFocusPlayTimestamp: CFTimeInterval = 0
 
     public var isEnabled: Bool = true
@@ -25,11 +25,12 @@ public final class UISoundPlayer {
         preloadAll()
     }
 
-    private func configureAmbientSessionIfNeeded() {
-        guard !sessionConfigured else { return }
-        sessionConfigured = true
+    private func ensureSafeAudioSession() {
         let session = AVAudioSession.sharedInstance()
-        try? session.setCategory(.ambient, mode: .default, options: [.mixWithOthers])
+        // CRITICAL: Never override `.playback` (used by KSPlayer / AVPlayer for surround & Atmos)!
+        if session.category != .playback && session.category != .ambient {
+            try? session.setCategory(.ambient, mode: .default, options: [.mixWithOthers])
+        }
     }
 
     private func preloadAll() {
@@ -72,7 +73,7 @@ public final class UISoundPlayer {
     }
 
     private func play(_ kind: SoundKind) {
-        configureAmbientSessionIfNeeded()
+        ensureSafeAudioSession()
         guard let list = pools[kind], !list.isEmpty else { return }
         let idx = (poolIndex[kind] ?? 0) % list.count
         poolIndex[kind] = (idx + 1) % list.count

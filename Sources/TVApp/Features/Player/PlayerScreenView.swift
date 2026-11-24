@@ -41,6 +41,7 @@ struct PlayerScreenView: View {
     @State private var activeStreamURL: URL?
     @State private var enginePreference: PreferredEngineChoice = .auto
     @State private var subtitleTrack: ParsedSubtitleTrack?
+    @State private var suppressExternalSubtitle: Bool = false
     @State private var topNotice: String?
     @State private var showHUD = false
     @State private var showSubtitleDrawer = false
@@ -80,7 +81,7 @@ struct PlayerScreenView: View {
                 .allowsHitTesting(false)
 
             SubtitleOverlayView(
-                track: subtitleTrack ?? ParsedSubtitleTrack(cues: [], format: "empty"),
+                track: (suppressExternalSubtitle ? nil : subtitleTrack) ?? ParsedSubtitleTrack(cues: [], format: "empty"),
                 style: style,
                 currentTime: (scrub.isScrubbing || scrub.isCommitting) ? scrub.displayedFrameTime : engine.currentTime
             )
@@ -133,6 +134,7 @@ struct PlayerScreenView: View {
                     if scrub.isScrubbing {
                         commitActiveScrub()
                     } else {
+                        UISoundPlayer.shared.playBack()
                         shutdown()
                     }
                 }
@@ -216,9 +218,7 @@ struct PlayerScreenView: View {
                             engine.selectAudioTrack(id: id)
                         },
                         onSelectEmbeddedSubtitle: { id in
-                            if id != nil {
-                                subtitleTrack = nil
-                            }
+                            suppressExternalSubtitle = (id != nil)
                             engine.selectEmbeddedSubtitleTrack(id: id)
                         },
                         onSwitchEngine: { choice in
@@ -279,13 +279,17 @@ struct PlayerScreenView: View {
             if scrub.isScrubbing {
                 commitActiveScrub()
             } else if showSubtitleDrawer {
+                UISoundPlayer.shared.playBack()
                 showSubtitleDrawer = false
             } else if showAudioDrawer {
+                UISoundPlayer.shared.playBack()
                 showAudioDrawer = false
             } else if showHUD {
+                UISoundPlayer.shared.playBack()
                 hudHideTask?.cancel()
                 showHUD = false
             } else {
+                UISoundPlayer.shared.playBack()
                 shutdown()
             }
         }
@@ -436,6 +440,12 @@ struct PlayerScreenView: View {
                 startAt: currentPos,
                 preference: choice
             )
+            if engine.activeEngineKind == .avPlayer {
+                DisplayModeCoordinator.shared.apply(
+                    refreshRate: Float(engine.currentStats().frameRate),
+                    formatDescription: engine.avAdapter.videoFormatDescription
+                )
+            }
         } catch {
             loadError = error.localizedDescription
         }

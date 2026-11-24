@@ -2,8 +2,8 @@ import SwiftUI
 import SubtitleKit
 
 /// Renders side-loaded SRT/VTT (and ASS when style override is on) with live
-/// style binding: position, size, colour, opacity, weight, outline, background,
-/// and timeline delay — all adjustable while the video keeps playing.
+/// style binding: position, size, colour, opacity, weight, true text outline,
+/// optional dark pill background, and timeline delay.
 public struct SubtitleOverlayView: View {
     public let track: ParsedSubtitleTrack
     public let style: SubtitleStyleConfig
@@ -27,25 +27,14 @@ public struct SubtitleOverlayView: View {
             if !text.isEmpty {
                 VStack {
                     Spacer()
-                    Text(text)
-                        .font(.system(size: style.fontSize, weight: style.fontWeight.swiftWeight))
-                        .foregroundStyle(Color(hex: style.textColorHex).opacity(style.textOpacity))
-                        .multilineTextAlignment(.center)
-                        .lineLimit(4)
-                        .padding(.horizontal, 24)
-                        .padding(.vertical, 10)
+                    outlinedSubtitleText(text)
+                        .padding(.horizontal, style.backgroundOpacity > 0.01 ? 24 : 12)
+                        .padding(.vertical, style.backgroundOpacity > 0.01 ? 10 : 4)
                         .background(
                             Color.black.opacity(style.backgroundOpacity),
                             in: RoundedRectangle(cornerRadius: 12, style: .continuous)
                         )
-                        .overlay(
-                            RoundedRectangle(cornerRadius: 12, style: .continuous)
-                                .strokeBorder(
-                                    Color(hex: style.outlineColorHex).opacity(style.outlineWidth > 0 ? 1 : 0),
-                                    lineWidth: style.outlineWidth
-                                )
-                        )
-                        .shadow(color: .black.opacity(0.9), radius: max(1, style.outlineWidth), x: 0, y: 1)
+                        .padding(.horizontal, 60)
                         .padding(.bottom, proxy.size.height * style.bottomOffsetRatio)
                         .frame(maxWidth: .infinity)
                         .animation(.easeOut(duration: 0.08), value: text)
@@ -53,6 +42,36 @@ public struct SubtitleOverlayView: View {
             }
         }
         .allowsHitTesting(false)
+    }
+
+    @ViewBuilder
+    private func outlinedSubtitleText(_ text: String) -> some View {
+        let baseFont = Font.system(size: style.fontSize, weight: style.fontWeight.swiftWeight)
+        let outlineColor = Color(hex: style.outlineColorHex).opacity(min(1.0, style.textOpacity))
+        let d = CGFloat(style.outlineWidth) * 0.55
+
+        ZStack {
+            if style.outlineWidth > 0.1 {
+                // True 4-directional crisp character edge stroke (never an ugly floating rectangle!)
+                Group {
+                    Text(text).offset(x: -d, y: -d)
+                    Text(text).offset(x:  d, y: -d)
+                    Text(text).offset(x: -d, y:  d)
+                    Text(text).offset(x:  d, y:  d)
+                }
+                .font(baseFont)
+                .foregroundStyle(outlineColor)
+                .multilineTextAlignment(.center)
+                .lineLimit(4)
+            }
+
+            Text(text)
+                .font(baseFont)
+                .foregroundStyle(Color(hex: style.textColorHex).opacity(style.textOpacity))
+                .multilineTextAlignment(.center)
+                .lineLimit(4)
+                .shadow(color: .black.opacity(0.85), radius: max(1.5, CGFloat(style.outlineWidth)), x: 0, y: 2)
+        }
     }
 }
 

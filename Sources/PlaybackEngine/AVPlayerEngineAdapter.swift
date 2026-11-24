@@ -84,10 +84,53 @@ public final class AVPlayerEngineAdapter: NSObject, ObservableObject, PlayerEngi
             )
         }
 
+        await refreshTracks(for: item)
+
         if time > 0 {
             await seek(to: time, precise: true)
         }
         play()
+    }
+
+    private func refreshTracks(for item: AVPlayerItem) async {
+        if let audible = try? await item.asset.loadMediaSelectionGroup(for: .audible) {
+            let selected = item.currentMediaSelection.selectedMediaOption(in: audible)
+            audioTracks = audible.options.enumerated().map { idx, opt in
+                EngineTrackInfo(
+                    id: Int32(idx),
+                    name: opt.displayName,
+                    languageCode: opt.extendedLanguageTag ?? opt.locale?.language.languageCode?.identifier,
+                    isEnabled: opt == selected,
+                    isImageSubtitle: false
+                )
+            }
+        } else {
+            audioTracks = []
+        }
+
+        if let legible = try? await item.asset.loadMediaSelectionGroup(for: .legible) {
+            let selected = item.currentMediaSelection.selectedMediaOption(in: legible)
+            embeddedSubtitleTracks = legible.options.enumerated().map { idx, opt in
+                EngineTrackInfo(
+                    id: Int32(idx),
+                    name: opt.displayName,
+                    languageCode: opt.extendedLanguageTag ?? opt.locale?.language.languageCode?.identifier,
+                    isEnabled: opt == selected,
+                    isImageSubtitle: false
+                )
+            }
+        } else {
+            embeddedSubtitleTracks = []
+        }
+    }
+
+    public func shutdown() {
+        player.pause()
+        player.replaceCurrentItem(with: nil)
+        currentItem = nil
+        isPlaying = false
+        audioTracks = []
+        embeddedSubtitleTracks = []
     }
 
     struct ProbeResult: Sendable {
@@ -190,6 +233,7 @@ public final class AVPlayerEngineAdapter: NSObject, ObservableObject, PlayerEngi
                 let idx = Int(id)
                 if idx >= 0 && idx < group.options.count {
                     item.select(group.options[idx], in: group)
+                    await self.refreshTracks(for: item)
                 }
             }
         }
@@ -204,6 +248,7 @@ public final class AVPlayerEngineAdapter: NSObject, ObservableObject, PlayerEngi
                 } else {
                     item.select(nil, in: group)
                 }
+                await self.refreshTracks(for: item)
             }
         }
     }

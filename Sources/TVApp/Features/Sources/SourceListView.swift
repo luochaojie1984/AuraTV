@@ -108,7 +108,7 @@ struct SourceEditorView: View {
                 field("端口（留空用默认）", text: $port, placeholder: protocolType == .smb ? "445" : "80")
                 field("路径 / 共享名", text: $basePath, placeholder: "/AV 或 /Movies")
                 field("用户名", text: $username, placeholder: "guest")
-                field("密码", text: $password, placeholder: "仅存 Keychain")
+                field("密码", text: $password, placeholder: existing == nil ? "仅存 Keychain" : "留空则保留原密码")
 
                 if protocolType == .webdav {
                     Toggle("使用 HTTPS", isOn: $useTLS)

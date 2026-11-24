@@ -74,6 +74,14 @@ struct FileBrowserView: View {
             }
         }
         .task { await boot() }
+        .onExitCommand {
+            UISoundPlayer.shared.playBack()
+            if path != "/" {
+                Task { await goUp() }
+            } else {
+                dismiss()
+            }
+        }
         .fullScreenCover(item: $playbackRequest) { req in
             PlayerScreenView(request: req)
         }

@@ -147,14 +147,14 @@ public final class PlaybackCoordinator: ObservableObject {
     }
 
     public func shutdown() {
-        avAdapter.pause()
+        avAdapter.shutdown()
         #if canImport(KSPlayer) && !targetEnvironment(simulator)
         ksAdapter.shutdown()
         #endif
     }
 
     private func stopCurrentEngine() {
-        avAdapter.pause()
+        avAdapter.shutdown()
         #if canImport(KSPlayer) && !targetEnvironment(simulator)
         ksAdapter.shutdown()
         #endif

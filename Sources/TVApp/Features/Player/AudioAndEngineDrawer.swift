@@ -16,10 +16,15 @@ struct AudioAndEngineDrawer: View {
                 Text("音轨与解码引擎")
                     .font(.system(size: 28, weight: .bold))
                 Spacer()
-                Button { UISoundPlayer.shared.playBack(); onClose() } label: {
-                    Image(systemName: "xmark")
+                Button {
+                    UISoundPlayer.shared.playBack()
+                    onClose()
+                } label: {
+                    Image(systemName: "xmark.circle.fill")
+                        .font(.system(size: 28))
+                        .padding(4)
                 }
-                .buttonStyle(.bordered)
+                .buttonStyle(TVOptionButtonStyle())
             }
 
             Divider().overlay(Color.white.opacity(0.15))
@@ -29,20 +34,20 @@ struct AudioAndEngineDrawer: View {
                     sectionHeader("当前解码核心：\(activeEngineKind.rawValue)")
                     VStack(spacing: 10) {
                         ForEach(PreferredEngineChoice.allCases, id: \.self) { choice in
+                            let selected = (choice == currentPreference)
                             Button {
                                 onSwitchEngine(choice)
                             } label: {
-                                HStack {
+                                drawerRow(selected: selected) {
                                     Text(choice.rawValue)
                                     Spacer()
-                                    if choice == currentPreference {
+                                    if selected {
                                         Image(systemName: "checkmark.circle.fill")
                                             .foregroundStyle(TVTheme.accent)
                                     }
                                 }
-                                .frame(maxWidth: .infinity)
                             }
-                            .buttonStyle(.bordered)
+                            .buttonStyle(TVOptionButtonStyle(cornerRadius: 14))
                         }
                     }
 
@@ -57,7 +62,7 @@ struct AudioAndEngineDrawer: View {
                                 Button {
                                     onSelectAudio(track.id)
                                 } label: {
-                                    HStack {
+                                    drawerRow(selected: track.isEnabled) {
                                         Text(track.name.isEmpty ? "音轨 #\(track.id)" : track.name)
                                             .lineLimit(1)
                                         if let lang = track.languageCode {
@@ -71,9 +76,8 @@ struct AudioAndEngineDrawer: View {
                                                 .foregroundStyle(TVTheme.accent)
                                         }
                                     }
-                                    .frame(maxWidth: .infinity)
                                 }
-                                .buttonStyle(.bordered)
+                                .buttonStyle(TVOptionButtonStyle(cornerRadius: 14))
                             }
                         }
                     }
@@ -84,23 +88,27 @@ struct AudioAndEngineDrawer: View {
                             .font(.system(size: 16))
                             .foregroundStyle(TVTheme.tertiaryText)
                     } else {
+                        let anyEmbeddedEnabled = embeddedSubtitleTracks.contains(where: \.isEnabled)
                         VStack(spacing: 10) {
                             Button {
                                 onSelectEmbeddedSubtitle(nil)
                             } label: {
-                                HStack {
-                                    Text("关闭内封字幕")
+                                drawerRow(selected: !anyEmbeddedEnabled) {
+                                    Text("关闭内封字幕（恢复外挂字幕）")
                                     Spacer()
+                                    if !anyEmbeddedEnabled {
+                                        Image(systemName: "checkmark.circle.fill")
+                                            .foregroundStyle(TVTheme.accent)
+                                    }
                                 }
-                                .frame(maxWidth: .infinity)
                             }
-                            .buttonStyle(.bordered)
+                            .buttonStyle(TVOptionButtonStyle(cornerRadius: 14))
 
                             ForEach(embeddedSubtitleTracks) { sub in
                                 Button {
                                     onSelectEmbeddedSubtitle(sub.id)
                                 } label: {
-                                    HStack {
+                                    drawerRow(selected: sub.isEnabled) {
                                         Text(sub.name.isEmpty ? "内封字幕 #\(sub.id)" : sub.name)
                                             .lineLimit(1)
                                         if sub.isImageSubtitle {
@@ -114,19 +122,34 @@ struct AudioAndEngineDrawer: View {
                                                 .foregroundStyle(TVTheme.accent)
                                         }
                                     }
-                                    .frame(maxWidth: .infinity)
                                 }
-                                .buttonStyle(.bordered)
+                                .buttonStyle(TVOptionButtonStyle(cornerRadius: 14))
                             }
                         }
                     }
                 }
+                .padding(.vertical, 6)
+                .padding(.horizontal, 4)
             }
         }
         .padding(26)
         .frame(width: 560)
         .frame(maxHeight: .infinity)
         .tvGlassSurface(cornerRadius: 26)
+    }
+
+    private func drawerRow<Content: View>(selected: Bool, @ViewBuilder content: () -> Content) -> some View {
+        HStack(spacing: 10) {
+            content()
+        }
+        .font(.system(size: 18, weight: selected ? .semibold : .regular))
+        .padding(.horizontal, 16)
+        .padding(.vertical, 12)
+        .frame(maxWidth: .infinity)
+        .background(
+            selected ? TVTheme.accent.opacity(0.24) : Color.white.opacity(0.08),
+            in: RoundedRectangle(cornerRadius: 14, style: .continuous)
+        )
     }
 
     private func sectionHeader(_ text: String) -> some View {

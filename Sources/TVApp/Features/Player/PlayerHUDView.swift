@@ -64,9 +64,12 @@ struct PlayerHUDView: View {
                 } label: {
                     Text("-\(stepInt)s")
                         .font(.system(size: 17, weight: .bold, design: .monospaced))
-                        .foregroundStyle(TVTheme.secondaryText)
+                        .foregroundStyle(.white.opacity(0.88))
+                        .padding(.horizontal, 14)
+                        .padding(.vertical, 6)
+                        .background(Color.white.opacity(0.10), in: Capsule())
                 }
-                .buttonStyle(.plain)
+                .buttonStyle(TVOptionButtonStyle())
                 .disabled(engine.duration <= 0)
 
                 GeometryReader { proxy in
@@ -84,9 +87,12 @@ struct PlayerHUDView: View {
                 } label: {
                     Text("+\(stepInt)s")
                         .font(.system(size: 17, weight: .bold, design: .monospaced))
-                        .foregroundStyle(TVTheme.secondaryText)
+                        .foregroundStyle(.white.opacity(0.88))
+                        .padding(.horizontal, 14)
+                        .padding(.vertical, 6)
+                        .background(Color.white.opacity(0.10), in: Capsule())
                 }
-                .buttonStyle(.plain)
+                .buttonStyle(TVOptionButtonStyle())
                 .disabled(engine.duration <= 0)
             }
         }

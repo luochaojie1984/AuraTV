@@ -36,11 +36,15 @@ public enum VideoBadgeParser {
     ]
 
     public static func badges(for fileName: String) -> [VideoBadge] {
-        let haystack = " " + fileName
-            .replacingOccurrences(of: ".", with: " ")
-            .replacingOccurrences(of: "_", with: " ")
-            .replacingOccurrences(of: "-", with: " ")
-            .lowercased() + " "
+        let normalized = fileName.map { ch -> Character in
+            switch ch {
+            case ".", "_", "-", "[", "]", "(", ")", "【", "】", "（", "）", "·", "/":
+                return " "
+            default:
+                return ch
+            }
+        }
+        let haystack = " " + String(normalized).lowercased() + " "
         var seen = Set<String>()
         var result: [VideoBadge] = []
         for rule in rules where !seen.contains(rule.badge) {

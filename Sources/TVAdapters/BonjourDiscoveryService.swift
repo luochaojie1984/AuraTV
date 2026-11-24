@@ -106,8 +106,10 @@ public final class BonjourDiscoveryService: NSObject, ObservableObject {
         }
     }
 
-    private func resolveKey(serviceNamed name: String) -> String? {
-        pending.first { $0.value.serviceName == name }?.key
+    private func resolveKey(serviceNamed name: String, serviceType: String) -> String? {
+        pending.first { _, meta in
+            meta.serviceName == name && serviceType.hasPrefix(meta.bonjourType)
+        }?.key ?? pending.first { $0.value.serviceName == name }?.key
     }
 
     private func finishResolve(key: String, hostName: String, port: Int) {
@@ -142,18 +144,20 @@ public final class BonjourDiscoveryService: NSObject, ObservableObject {
 extension BonjourDiscoveryService: NetServiceDelegate {
     public nonisolated func netServiceDidResolveAddress(_ sender: NetService) {
         let name = sender.name
+        let type = sender.type
         let host = sender.hostName ?? ""
         let port = sender.port
         Task { @MainActor [weak self] in
-            guard let self, let key = self.resolveKey(serviceNamed: name) else { return }
+            guard let self, let key = self.resolveKey(serviceNamed: name, serviceType: type) else { return }
             self.finishResolve(key: key, hostName: host, port: port)
         }
     }
 
     public nonisolated func netService(_ sender: NetService, didNotResolve errorDict: [String: NSNumber]) {
         let name = sender.name
+        let type = sender.type
         Task { @MainActor [weak self] in
-            guard let self, let key = self.resolveKey(serviceNamed: name) else { return }
+            guard let self, let key = self.resolveKey(serviceNamed: name, serviceType: type) else { return }
             self.dropPending(key: key)
         }
     }

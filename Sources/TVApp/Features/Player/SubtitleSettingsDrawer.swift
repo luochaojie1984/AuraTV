@@ -82,10 +82,9 @@ struct SubtitleSettingsDrawer: View {
                 .padding(26)
             }
         }
-        .background(.ultraThinMaterial)
-        .clipShape(RoundedRectangle(cornerRadius: 26, style: .continuous))
-        .padding(.vertical, 60)
-        .padding(.trailing, 40)
+        .frame(width: 560)
+        .frame(maxHeight: .infinity)
+        .tvGlassSurface(cornerRadius: 26)
     }
 
     private var colorRow: some View {
