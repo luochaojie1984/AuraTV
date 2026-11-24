@@ -26,7 +26,7 @@ struct RootView: View {
 
     var body: some View {
         ZStack {
-            TVTheme.backdrop.ignoresSafeArea()
+            TVTheme.cinemaBackdrop.ignoresSafeArea()
 
             TabView(selection: $selection) {
                 HomeView()

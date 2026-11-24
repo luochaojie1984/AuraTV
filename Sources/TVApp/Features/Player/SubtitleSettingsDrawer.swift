@@ -1,22 +1,30 @@
 import SwiftUI
 import SubtitleKit
 
-/// 右侧 38% 半透明字幕样式抽屉：边看边调，全部改动实时落盘。
+/// 右侧半透明字幕与样式抽屉：支持切换同目录外挂字幕，并实时调整外观与时间轴。
 struct SubtitleSettingsDrawer: View {
     let style: SubtitleStyleConfig
-    let subtitleName: String?
-    let hasSubtitle: Bool
+    let externalSubtitles: [MatchedSubtitleCandidate]
+    let selectedExternalPath: String?
+    let onSelectExternalSubtitle: (MatchedSubtitleCandidate?) -> Void
     let onStyleChange: (@escaping @Sendable (inout SubtitleStyleConfig) -> Void) -> Void
     let onClose: () -> Void
+
+    private var activeSubtitleLabel: String {
+        if let selectedExternalPath,
+           let match = externalSubtitles.first(where: { $0.path == selectedExternalPath }) {
+            return "\(match.detectedLanguageLabel) · \(match.formatExtension.uppercased())"
+        }
+        return externalSubtitles.isEmpty ? "未检测到外挂字幕" : "已关闭外挂字幕"
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             HStack {
                 VStack(alignment: .leading, spacing: 4) {
-                    Text("字幕样式")
+                    Text("字幕与样式")
                         .font(.system(size: 28, weight: .bold))
-                    Text(subtitleName ?? (hasSubtitle ? "已加载" : "未检测到外挂字幕")
-                         + " · 所有调整实时生效")
+                    Text(activeSubtitleLabel)
                         .font(.system(size: 16))
                         .foregroundStyle(TVTheme.secondaryText)
                 }
@@ -38,6 +46,10 @@ struct SubtitleSettingsDrawer: View {
 
             ScrollView {
                 VStack(spacing: 12) {
+                    if !externalSubtitles.isEmpty {
+                        externalTrackSection
+                    }
+
                     stepperRow(
                         title: "字号",
                         value: "\(Int(style.fontSize)) pt",
@@ -85,6 +97,70 @@ struct SubtitleSettingsDrawer: View {
         .frame(width: 560)
         .frame(maxHeight: .infinity)
         .tvGlassSurface(cornerRadius: 26)
+    }
+
+    private var externalTrackSection: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text("外挂字幕轨 (\(externalSubtitles.count))")
+                .font(.system(size: 18, weight: .semibold))
+
+            Button {
+                onSelectExternalSubtitle(nil)
+            } label: {
+                let offSelected = (selectedExternalPath == nil)
+                HStack {
+                    Text("关闭外挂字幕")
+                    Spacer()
+                    if offSelected {
+                        Image(systemName: "checkmark.circle.fill")
+                            .foregroundStyle(TVTheme.accent)
+                    }
+                }
+                .font(.system(size: 16, weight: offSelected ? .semibold : .regular))
+                .padding(.horizontal, 14)
+                .padding(.vertical, 10)
+                .frame(maxWidth: .infinity)
+                .background(
+                    offSelected ? TVTheme.accent.opacity(0.24) : Color.white.opacity(0.08),
+                    in: RoundedRectangle(cornerRadius: 12, style: .continuous)
+                )
+            }
+            .buttonStyle(TVOptionButtonStyle(cornerRadius: 12))
+
+            ForEach(externalSubtitles) { candidate in
+                let active = (candidate.path == selectedExternalPath)
+                Button {
+                    onSelectExternalSubtitle(candidate)
+                } label: {
+                    HStack(spacing: 8) {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(candidate.name)
+                                .font(.system(size: 16, weight: active ? .semibold : .regular))
+                                .lineLimit(1)
+                            Text("\(candidate.detectedLanguageLabel) · \(candidate.formatExtension.uppercased())")
+                                .font(.system(size: 13))
+                                .foregroundStyle(TVTheme.secondaryText)
+                        }
+                        Spacer()
+                        if active {
+                            Image(systemName: "checkmark.circle.fill")
+                                .foregroundStyle(TVTheme.accent)
+                        }
+                    }
+                    .padding(.horizontal, 14)
+                    .padding(.vertical, 10)
+                    .frame(maxWidth: .infinity)
+                    .background(
+                        active ? TVTheme.accent.opacity(0.24) : Color.white.opacity(0.08),
+                        in: RoundedRectangle(cornerRadius: 12, style: .continuous)
+                    )
+                }
+                .buttonStyle(TVOptionButtonStyle(cornerRadius: 12))
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(14)
+        .background(Color.white.opacity(0.05), in: RoundedRectangle(cornerRadius: 14, style: .continuous))
     }
 
     private var colorRow: some View {
@@ -143,8 +219,8 @@ struct SubtitleSettingsDrawer: View {
     private var toggleRow: some View {
         HStack {
             VStack(alignment: .leading, spacing: 4) {
-                Text("强制覆盖 ASS 样式").font(.system(size: 18, weight: .semibold))
-                Text("关闭时特效 ASS 交由播放核原生渲染").font(.system(size: 15)).foregroundStyle(TVTheme.secondaryText)
+                Text("统一文字样式").font(.system(size: 18, weight: .semibold))
+                Text("统一外挂字幕的字号、配色与位置").font(.system(size: 15)).foregroundStyle(TVTheme.secondaryText)
             }
             Spacer()
             Button {
@@ -187,12 +263,11 @@ struct SubtitleSettingsDrawer: View {
                 .buttonStyle(TVOptionButtonStyle())
             Text(value)
                 .font(.system(size: 19, weight: .semibold, design: .monospaced))
-                .frame(width: 110)
+                .frame(width: 96, alignment: .center)
             Button(action: onPlus) { Image(systemName: "plus.circle.fill").font(.system(size: 26)) }
                 .buttonStyle(TVOptionButtonStyle())
         }
-        .padding(.horizontal, 14)
-        .padding(.vertical, 12)
+        .padding(14)
         .background(Color.white.opacity(0.05), in: RoundedRectangle(cornerRadius: 14, style: .continuous))
     }
 }

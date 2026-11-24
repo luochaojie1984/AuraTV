@@ -16,9 +16,13 @@ public final class PlaybackCoordinator: ObservableObject {
     @Published public private(set) var currentTime: TimeInterval = 0
     @Published public private(set) var duration: TimeInterval = 0
     @Published public private(set) var isPlaying: Bool = false
+    @Published public private(set) var playbackRate: Float = 1.0
+    @Published public private(set) var aspectMode: VideoAspectMode = .fit
     @Published public private(set) var audioTracks: [EngineTrackInfo] = []
     @Published public private(set) var embeddedSubtitleTracks: [EngineTrackInfo] = []
     @Published public private(set) var activeEngineKind: PreferredEngineChoice = .ksPlayer
+
+    public var onPlaybackEnded: (@MainActor () -> Void)?
 
     public let avAdapter = AVPlayerEngineAdapter()
     #if canImport(KSPlayer) && !targetEnvironment(simulator)
@@ -32,6 +36,11 @@ public final class PlaybackCoordinator: ObservableObject {
     }
 
     private func bindAdapters() {
+        avAdapter.onPlaybackEnded = { [weak self] in
+            guard let self, self.activeEngineKind == .avPlayer else { return }
+            self.onPlaybackEnded?()
+        }
+
         avAdapter.$currentTime.sink { [weak self] val in
             guard let self, self.activeEngineKind == .avPlayer else { return }
             self.currentTime = val
@@ -54,6 +63,11 @@ public final class PlaybackCoordinator: ObservableObject {
         }.store(in: &cancellables)
 
         #if canImport(KSPlayer) && !targetEnvironment(simulator)
+        ksAdapter.onPlaybackEnded = { [weak self] in
+            guard let self, self.activeEngineKind == .ksPlayer else { return }
+            self.onPlaybackEnded?()
+        }
+
         ksAdapter.$currentTime.sink { [weak self] val in
             guard let self, self.activeEngineKind == .ksPlayer else { return }
             self.currentTime = val
@@ -108,6 +122,8 @@ public final class PlaybackCoordinator: ObservableObject {
         stopCurrentEngine()
         activeEngineKind = Self.recommendedEngine(for: fileName, preference: preference)
         try await activeEngine.load(url: url, startAt: time)
+        activeEngine.setAspectMode(aspectMode)
+        activeEngine.setPlaybackRate(playbackRate)
     }
 
     public func play() {
@@ -131,7 +147,13 @@ public final class PlaybackCoordinator: ObservableObject {
     }
 
     public func setPlaybackRate(_ rate: Float) {
+        playbackRate = rate
         activeEngine.setPlaybackRate(rate)
+    }
+
+    public func setAspectMode(_ mode: VideoAspectMode) {
+        aspectMode = mode
+        activeEngine.setAspectMode(mode)
     }
 
     public func selectAudioTrack(id: Int32) {

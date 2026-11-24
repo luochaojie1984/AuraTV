@@ -69,6 +69,7 @@ public struct AppSettings: Codable, Equatable, Sendable {
 
     // Playback resume (记忆播放 / 断点续播) & remembered LAN folders
     public var enableResumePlayback: Bool
+    public var autoPlayNextEpisode: Bool
     public var enableUISoundEffects: Bool
     public var lastVisitedPaths: [String: String]
 
@@ -87,6 +88,7 @@ public struct AppSettings: Codable, Equatable, Sendable {
         showScrubTimeText: Bool = true,
         scrubTimeTextOpacity: Double = 0.72,
         enableResumePlayback: Bool = true,
+        autoPlayNextEpisode: Bool = true,
         enableUISoundEffects: Bool = true,
         lastVisitedPaths: [String: String] = [:],
         readAheadCacheLimitMB: Int = 96,
@@ -103,6 +105,7 @@ public struct AppSettings: Codable, Equatable, Sendable {
         self.showScrubTimeText = showScrubTimeText
         self.scrubTimeTextOpacity = scrubTimeTextOpacity
         self.enableResumePlayback = enableResumePlayback
+        self.autoPlayNextEpisode = autoPlayNextEpisode
         self.enableUISoundEffects = enableUISoundEffects
         self.lastVisitedPaths = lastVisitedPaths
         self.readAheadCacheLimitMB = readAheadCacheLimitMB
@@ -121,6 +124,7 @@ public struct AppSettings: Codable, Equatable, Sendable {
         case showScrubTimeText
         case scrubTimeTextOpacity
         case enableResumePlayback
+        case autoPlayNextEpisode
         case enableUISoundEffects
         case lastVisitedPaths
         case readAheadCacheLimitMB
@@ -140,6 +144,7 @@ public struct AppSettings: Codable, Equatable, Sendable {
         self.showScrubTimeText = try c.decodeIfPresent(Bool.self, forKey: .showScrubTimeText) ?? true
         self.scrubTimeTextOpacity = try c.decodeIfPresent(Double.self, forKey: .scrubTimeTextOpacity) ?? 0.72
         self.enableResumePlayback = try c.decodeIfPresent(Bool.self, forKey: .enableResumePlayback) ?? true
+        self.autoPlayNextEpisode = try c.decodeIfPresent(Bool.self, forKey: .autoPlayNextEpisode) ?? true
         self.enableUISoundEffects = try c.decodeIfPresent(Bool.self, forKey: .enableUISoundEffects) ?? true
         self.lastVisitedPaths = try c.decodeIfPresent([String: String].self, forKey: .lastVisitedPaths) ?? [:]
         self.readAheadCacheLimitMB = try c.decodeIfPresent(Int.self, forKey: .readAheadCacheLimitMB) ?? 96

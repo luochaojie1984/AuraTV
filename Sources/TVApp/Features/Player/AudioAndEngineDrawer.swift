@@ -5,15 +5,21 @@ struct AudioAndEngineDrawer: View {
     let embeddedSubtitleTracks: [EngineTrackInfo]
     let activeEngineKind: PreferredEngineChoice
     let currentPreference: PreferredEngineChoice
+    let playbackRate: Float
+    let aspectMode: VideoAspectMode
+    let onSelectRate: (Float) -> Void
+    let onSelectAspectMode: (VideoAspectMode) -> Void
     let onSelectAudio: (Int32) -> Void
     let onSelectEmbeddedSubtitle: (Int32?) -> Void
     let onSwitchEngine: (PreferredEngineChoice) -> Void
     let onClose: () -> Void
 
+    private let rateChoices: [Float] = [0.75, 1.0, 1.25, 1.5, 2.0]
+
     var body: some View {
         VStack(alignment: .leading, spacing: 18) {
             HStack {
-                Text("音轨与解码引擎")
+                Text("播放设置")
                     .font(.system(size: 28, weight: .bold))
                 Spacer()
                 Button {
@@ -31,27 +37,47 @@ struct AudioAndEngineDrawer: View {
 
             ScrollView {
                 VStack(alignment: .leading, spacing: 20) {
-                    sectionHeader("当前解码核心：\(activeEngineKind.rawValue)")
-                    VStack(spacing: 10) {
-                        ForEach(PreferredEngineChoice.allCases, id: \.self) { choice in
-                            let selected = (choice == currentPreference)
+                    sectionHeader("播放倍速")
+                    HStack(spacing: 10) {
+                        ForEach(rateChoices, id: \.self) { rate in
+                            let selected = abs(playbackRate - rate) < 0.01
                             Button {
-                                onSwitchEngine(choice)
+                                onSelectRate(rate)
                             } label: {
-                                drawerRow(selected: selected) {
-                                    Text(choice.rawValue)
-                                    Spacer()
-                                    if selected {
-                                        Image(systemName: "checkmark.circle.fill")
-                                            .foregroundStyle(TVTheme.accent)
-                                    }
-                                }
+                                Text(formatRate(rate))
+                                    .font(.system(size: 17, weight: selected ? .bold : .medium, design: .monospaced))
+                                    .padding(.horizontal, 14)
+                                    .padding(.vertical, 9)
+                                    .background(
+                                        selected ? TVTheme.accent.opacity(0.35) : Color.white.opacity(0.08),
+                                        in: Capsule()
+                                    )
                             }
-                            .buttonStyle(TVOptionButtonStyle(cornerRadius: 14))
+                            .buttonStyle(TVOptionButtonStyle())
                         }
                     }
 
-                    sectionHeader("音轨切换 (\(audioTracks.count))")
+                    sectionHeader("画面比例")
+                    HStack(spacing: 10) {
+                        ForEach(VideoAspectMode.allCases, id: \.self) { mode in
+                            let selected = (mode == aspectMode)
+                            Button {
+                                onSelectAspectMode(mode)
+                            } label: {
+                                Text(mode.rawValue)
+                                    .font(.system(size: 17, weight: selected ? .bold : .medium))
+                                    .padding(.horizontal, 16)
+                                    .padding(.vertical, 9)
+                                    .background(
+                                        selected ? TVTheme.accent.opacity(0.35) : Color.white.opacity(0.08),
+                                        in: Capsule()
+                                    )
+                            }
+                            .buttonStyle(TVOptionButtonStyle())
+                        }
+                    }
+
+                    sectionHeader("音轨 (\(audioTracks.count))")
                     if audioTracks.isEmpty {
                         Text("暂无可切换音轨")
                             .font(.system(size: 16))
@@ -82,7 +108,7 @@ struct AudioAndEngineDrawer: View {
                         }
                     }
 
-                    sectionHeader("内封字幕 / PGS 图形字幕 (\(embeddedSubtitleTracks.count))")
+                    sectionHeader("内封字幕 (\(embeddedSubtitleTracks.count))")
                     if embeddedSubtitleTracks.isEmpty {
                         Text("未检测到内封字幕轨")
                             .font(.system(size: 16))
@@ -127,6 +153,26 @@ struct AudioAndEngineDrawer: View {
                             }
                         }
                     }
+
+                    sectionHeader("解码核心 · \(activeEngineKind.rawValue)")
+                    VStack(spacing: 10) {
+                        ForEach(PreferredEngineChoice.allCases, id: \.self) { choice in
+                            let selected = (choice == currentPreference)
+                            Button {
+                                onSwitchEngine(choice)
+                            } label: {
+                                drawerRow(selected: selected) {
+                                    Text(choice.rawValue)
+                                    Spacer()
+                                    if selected {
+                                        Image(systemName: "checkmark.circle.fill")
+                                            .foregroundStyle(TVTheme.accent)
+                                    }
+                                }
+                            }
+                            .buttonStyle(TVOptionButtonStyle(cornerRadius: 14))
+                        }
+                    }
                 }
                 .padding(.vertical, 6)
                 .padding(.horizontal, 4)
@@ -136,6 +182,10 @@ struct AudioAndEngineDrawer: View {
         .frame(width: 560)
         .frame(maxHeight: .infinity)
         .tvGlassSurface(cornerRadius: 26)
+    }
+
+    private func formatRate(_ rate: Float) -> String {
+        rate == floor(rate) ? String(format: "%.1fx", rate) : String(format: "%.2gx", rate)
     }
 
     private func drawerRow<Content: View>(selected: Bool, @ViewBuilder content: () -> Content) -> some View {

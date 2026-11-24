@@ -23,6 +23,12 @@ public struct EngineTrackInfo: Identifiable, Hashable, Sendable {
     }
 }
 
+public enum VideoAspectMode: String, CaseIterable, Codable, Sendable {
+    case fit = "原始比例"
+    case fill = "铺满屏幕"
+    case stretch = "全屏拉伸"
+}
+
 /// Uniform playback surface implemented by every engine core
 /// (KSPlayer/FFmpeg+VideoToolbox and AVPlayer/VideoToolbox).
 @MainActor
@@ -31,6 +37,7 @@ public protocol PlayerEngineProtocol: AnyObject {
     var duration: TimeInterval { get }
     var isPlaying: Bool { get }
     var playbackRate: Float { get }
+    var aspectMode: VideoAspectMode { get }
     var audioTracks: [EngineTrackInfo] { get }
     var embeddedSubtitleTracks: [EngineTrackInfo] { get }
 
@@ -42,6 +49,7 @@ public protocol PlayerEngineProtocol: AnyObject {
     func seekToKeyframePreview(at time: TimeInterval) async
     func setMuted(_ muted: Bool)
     func setPlaybackRate(_ rate: Float)
+    func setAspectMode(_ mode: VideoAspectMode)
     func selectAudioTrack(id: Int32)
     func selectEmbeddedSubtitleTrack(id: Int32?)
     func currentStats() -> PlaybackStats

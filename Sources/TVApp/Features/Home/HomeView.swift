@@ -12,6 +12,7 @@ struct PlaybackRequest: Identifiable {
     let source: MediaSourceConfig
     let item: VFSFileItem
     let resumeAt: TimeInterval
+    var playlist: [VFSFileItem] = []
 }
 
 struct HomeView: View {
@@ -19,25 +20,49 @@ struct HomeView: View {
     @StateObject private var discovery = BonjourDiscoveryService()
     @State private var browserTarget: BrowserTarget?
     @State private var playbackRequest: PlaybackRequest?
+    @State private var isAddingSource = false
+
+    private var unaddedDiscoveredHosts: [DiscoveredLANHost] {
+        discovery.discoveredHosts.filter { !env.isDiscoveredHostRemembered($0) }
+    }
 
     var body: some View {
-        ScrollView {
-            VStack(alignment: .leading, spacing: 34) {
-                header
+        ZStack {
+            TVTheme.cinemaBackdrop.ignoresSafeArea()
 
-                if env.settings.enableResumePlayback && !env.continueWatching.isEmpty {
-                    continueWatchingSection
+            ScrollView {
+                VStack(alignment: .leading, spacing: 42) {
+                    topBar
+
+                    if env.sources.isEmpty && (!env.settings.enableResumePlayback || env.continueWatching.isEmpty) {
+                        emptyHeroCard
+                        if !unaddedDiscoveredHosts.isEmpty {
+                            discoverySection
+                        }
+                    } else {
+                        if env.settings.enableResumePlayback && !env.continueWatching.isEmpty {
+                            continueWatchingSection
+                        }
+
+                        if !env.sources.isEmpty {
+                            sourcesSection
+                        }
+
+                        if !unaddedDiscoveredHosts.isEmpty {
+                            discoverySection
+                        }
+                    }
                 }
-
-                sourcesSection
-                discoverySection
+                .padding(.horizontal, TVMetrics.horizontalSafeMargin)
+                .padding(.vertical, TVMetrics.verticalSafeMargin)
             }
-            .padding(.horizontal, TVMetrics.horizontalSafeMargin)
-            .padding(.vertical, TVMetrics.verticalSafeMargin)
         }
         .onAppear { discovery.start() }
         .task { await env.reload() }
         .onDisappear { discovery.stop() }
+        .sheet(isPresented: $isAddingSource) {
+            SourceEditorView(existing: nil)
+        }
         .fullScreenCover(item: $browserTarget) { target in
             FileBrowserView(target: target)
         }
@@ -46,22 +71,142 @@ struct HomeView: View {
         }
     }
 
-    private var header: some View {
-        VStack(alignment: .leading, spacing: 8) {
+    // MARK: - Top Brand Bar
+
+    private var topBar: some View {
+        HStack(spacing: 16) {
+            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                .fill(
+                    LinearGradient(
+                        colors: [Color(red: 0.22, green: 0.74, blue: 0.97), Color(red: 0.24, green: 0.39, blue: 0.94)],
+                        startPoint: .topLeading,
+                        endPoint: .bottomTrailing
+                    )
+                )
+                .frame(width: 44, height: 44)
+                .overlay(
+                    Image(systemName: "play.fill")
+                        .font(.system(size: 20, weight: .bold))
+                        .foregroundStyle(.white)
+                        .offset(x: 1.5)
+                )
+                .shadow(color: Color(red: 0.22, green: 0.74, blue: 0.97).opacity(0.35), radius: 12, y: 4)
+
             Text("AuraTV")
-                .font(.system(size: 64, weight: .heavy))
+                .font(.system(size: 40, weight: .heavy))
                 .foregroundStyle(.white)
-            Text("局域网影视库 · SMB / WebDAV · 原生 HDR 与 MX 丝滑快进")
-                .font(.system(size: 24, weight: .medium))
-                .foregroundStyle(TVTheme.secondaryText)
+
+            Spacer()
+
+            if !env.sources.isEmpty {
+                Button {
+                    isAddingSource = true
+                } label: {
+                    Label("添加服务器", systemImage: "plus")
+                        .font(.system(size: 18, weight: .semibold))
+                        .foregroundStyle(.white.opacity(0.92))
+                        .padding(.horizontal, 20)
+                        .padding(.vertical, 10)
+                        .background(Color.white.opacity(0.10), in: Capsule())
+                }
+                .buttonStyle(TVOptionButtonStyle())
+            }
         }
     }
 
+    // MARK: - Empty Cinema Hero
+
+    private var emptyHeroCard: some View {
+        HStack {
+            Spacer()
+            VStack(spacing: 24) {
+                ZStack {
+                    Circle()
+                        .fill(
+                            RadialGradient(
+                                colors: [TVTheme.accent.opacity(0.36), .clear],
+                                center: .center,
+                                startRadius: 10,
+                                endRadius: 96
+                            )
+                        )
+                        .frame(width: 170, height: 170)
+
+                    RoundedRectangle(cornerRadius: 28, style: .continuous)
+                        .fill(
+                            LinearGradient(
+                                colors: [
+                                    Color(red: 0.22, green: 0.74, blue: 0.97),
+                                    Color(red: 0.31, green: 0.27, blue: 0.90)
+                                ],
+                                startPoint: .topLeading,
+                                endPoint: .bottomTrailing
+                            )
+                        )
+                        .frame(width: 104, height: 104)
+                        .overlay(
+                            Image(systemName: "play.fill")
+                                .font(.system(size: 46, weight: .bold))
+                                .foregroundStyle(.white)
+                                .offset(x: 3)
+                        )
+                        .overlay(
+                            RoundedRectangle(cornerRadius: 28, style: .continuous)
+                                .strokeBorder(.white.opacity(0.42), lineWidth: 1.5)
+                        )
+                        .shadow(color: TVTheme.accent.opacity(0.35), radius: 24, y: 10)
+                }
+
+                VStack(spacing: 10) {
+                    Text("连接媒体库")
+                        .font(.system(size: 40, weight: .bold))
+                        .foregroundStyle(.white)
+
+                    Text("SMB · WebDAV · 局域网直连")
+                        .font(.system(size: 20, weight: .medium))
+                        .foregroundStyle(.white.opacity(0.56))
+                }
+
+                Button {
+                    isAddingSource = true
+                } label: {
+                    HStack(spacing: 10) {
+                        Image(systemName: "plus.circle.fill")
+                            .font(.system(size: 22))
+                        Text("添加服务器")
+                            .font(.system(size: 22, weight: .semibold))
+                    }
+                    .foregroundStyle(.white)
+                    .padding(.horizontal, 34)
+                    .padding(.vertical, 16)
+                    .background(
+                        LinearGradient(
+                            colors: [Color(red: 0.14, green: 0.62, blue: 0.96), Color(red: 0.25, green: 0.38, blue: 0.92)],
+                            startPoint: .topLeading,
+                            endPoint: .bottomTrailing
+                        ),
+                        in: Capsule()
+                    )
+                }
+                .buttonStyle(TVOptionButtonStyle())
+                .padding(.top, 6)
+            }
+            .padding(.vertical, 54)
+            .padding(.horizontal, 80)
+            .frame(maxWidth: 920)
+            .tvGlassSurface(cornerRadius: 32)
+            Spacer()
+        }
+        .padding(.top, 20)
+    }
+
+    // MARK: - Populated Sections
+
     private var continueWatchingSection: some View {
-        VStack(alignment: .leading, spacing: 14) {
+        VStack(alignment: .leading, spacing: 18) {
             sectionTitle("继续观看")
             ScrollView(.horizontal, showsIndicators: false) {
-                HStack(spacing: 22) {
+                HStack(spacing: 24) {
                     ForEach(env.continueWatching) { record in
                         Button {
                             replay(record)
@@ -71,86 +216,68 @@ struct HomeView: View {
                                 barColor: Color(hex: env.settings.scrubBarColorHex)
                             )
                         }
-                        .buttonStyle(TVCardButtonStyle())
+                        .buttonStyle(TVCardButtonStyle(cornerRadius: 24))
                     }
                 }
-                .padding(.vertical, 12)
+                .padding(.vertical, 16)
+                .padding(.horizontal, 6)
             }
         }
     }
 
     private var sourcesSection: some View {
-        VStack(alignment: .leading, spacing: 14) {
-            sectionTitle("我的网络源（已记住）")
-            if env.sources.isEmpty {
-                Text("还没有网络源。按「网络源」标签页添加 SMB 或 WebDAV，或在下方局域网发现里一键连接（连上后会自动记住）。")
-                    .font(.system(size: 22))
-                    .foregroundStyle(TVTheme.tertiaryText)
-                    .padding(.vertical, 18)
-            } else {
-                LazyVGrid(columns: [GridItem(.adaptive(minimum: 420), spacing: 22)], spacing: 22) {
-                    ForEach(env.sources) { source in
-                        Button {
-                            browserTarget = BrowserTarget(source: source)
-                        } label: {
-                            SourceCard(
-                                source: source,
-                                isConnected: env.connectedSourceIDs.contains(source.id)
-                            )
-                        }
-                        .buttonStyle(TVCardButtonStyle())
+        VStack(alignment: .leading, spacing: 18) {
+            sectionTitle("服务器")
+            LazyVGrid(columns: [GridItem(.adaptive(minimum: 420), spacing: 24)], spacing: 24) {
+                ForEach(env.sources) { source in
+                    Button {
+                        browserTarget = BrowserTarget(source: source)
+                    } label: {
+                        SourceCard(
+                            source: source,
+                            isConnected: env.connectedSourceIDs.contains(source.id)
+                        )
                     }
+                    .buttonStyle(TVCardButtonStyle())
                 }
             }
         }
     }
 
     private var discoverySection: some View {
-        VStack(alignment: .leading, spacing: 14) {
-            sectionTitle("局域网发现（点一次即自动记住并进入）")
-            if discovery.discoveredHosts.isEmpty {
-                HStack(spacing: 12) {
-                    ProgressView()
-                    Text(discovery.isBrowsing ? "正在通过 Bonjour 搜索局域网设备…" : "未启动发现")
-                        .font(.system(size: 20))
-                        .foregroundStyle(TVTheme.tertiaryText)
-                }
-                .padding(.vertical, 12)
-            } else {
-                LazyVGrid(columns: [GridItem(.adaptive(minimum: 360), spacing: 18)], spacing: 18) {
-                    ForEach(discovery.discoveredHosts) { host in
-                        let remembered = env.isDiscoveredHostRemembered(host)
-                        Button {
-                            connectAndRememberDiscovered(host)
-                        } label: {
-                            HStack(spacing: 14) {
-                                Image(systemName: host.protocolType == "smb" ? "externaldrive.fill" : "network")
-                                    .font(.system(size: 26))
-                                    .foregroundStyle(remembered ? .green : TVTheme.accent)
-                                VStack(alignment: .leading, spacing: 4) {
-                                    HStack(spacing: 8) {
-                                        Text(host.serviceName)
-                                            .font(.system(size: 22, weight: .semibold))
-                                            .lineLimit(1)
-                                        if remembered {
-                                            Text("已记住")
-                                                .font(.system(size: 13, weight: .bold))
-                                                .foregroundStyle(.green)
-                                                .padding(.horizontal, 8)
-                                                .padding(.vertical, 2)
-                                                .background(Color.green.opacity(0.18), in: Capsule())
-                                        }
-                                    }
-                                    Text("\(host.hostName):\(host.port) · \(host.protocolType.uppercased())")
-                                        .font(.system(size: 17))
-                                        .foregroundStyle(TVTheme.secondaryText)
-                                }
-                                Spacer()
+        VStack(alignment: .leading, spacing: 18) {
+            sectionTitle("附近设备")
+            LazyVGrid(columns: [GridItem(.adaptive(minimum: 380), spacing: 20)], spacing: 20) {
+                ForEach(unaddedDiscoveredHosts) { host in
+                    Button {
+                        connectAndRememberDiscovered(host)
+                    } label: {
+                        HStack(spacing: 16) {
+                            RoundedRectangle(cornerRadius: 14, style: .continuous)
+                                .fill(Color.white.opacity(0.10))
+                                .frame(width: 56, height: 56)
+                                .overlay(
+                                    Image(systemName: host.protocolType == "smb" ? "externaldrive.fill" : "globe")
+                                        .font(.system(size: 24))
+                                        .foregroundStyle(TVTheme.accent)
+                                )
+                            VStack(alignment: .leading, spacing: 4) {
+                                Text(host.serviceName)
+                                    .font(.system(size: 22, weight: .semibold))
+                                    .lineLimit(1)
+                                Text("\(host.protocolType.uppercased()) · \(host.hostName)")
+                                    .font(.system(size: 16))
+                                    .foregroundStyle(TVTheme.secondaryText)
+                                    .lineLimit(1)
                             }
-                            .padding(18)
+                            Spacer()
+                            Image(systemName: "chevron.right")
+                                .font(.system(size: 16, weight: .semibold))
+                                .foregroundStyle(.white.opacity(0.35))
                         }
-                        .buttonStyle(TVCardButtonStyle(cornerRadius: 18))
+                        .padding(20)
                     }
+                    .buttonStyle(TVCardButtonStyle(cornerRadius: 20))
                 }
             }
         }
@@ -158,8 +285,8 @@ struct HomeView: View {
 
     private func sectionTitle(_ text: String) -> some View {
         Text(text)
-            .font(.system(size: 30, weight: .bold))
-            .foregroundStyle(.white.opacity(0.9))
+            .font(.system(size: 28, weight: .bold))
+            .foregroundStyle(.white.opacity(0.92))
     }
 
     private func connectAndRememberDiscovered(_ host: DiscoveredLANHost) {
@@ -194,29 +321,47 @@ struct SourceCard: View {
 
     var body: some View {
         HStack(spacing: 18) {
-            Image(systemName: source.protocolType == .smb ? "externaldrive.fill" : "globe.asia.australia.fill")
-                .font(.system(size: 40))
-                .foregroundStyle(TVTheme.accent)
+            RoundedRectangle(cornerRadius: 16, style: .continuous)
+                .fill(
+                    LinearGradient(
+                        colors: source.protocolType == .smb
+                            ? [Color(red: 0.14, green: 0.62, blue: 0.96).opacity(0.85), Color(red: 0.16, green: 0.36, blue: 0.85).opacity(0.85)]
+                            : [Color(red: 0.48, green: 0.36, blue: 0.95).opacity(0.85), Color(red: 0.30, green: 0.22, blue: 0.78).opacity(0.85)],
+                        startPoint: .topLeading,
+                        endPoint: .bottomTrailing
+                    )
+                )
+                .frame(width: 64, height: 64)
+                .overlay(
+                    Image(systemName: source.protocolType == .smb ? "externaldrive.fill" : "globe")
+                        .font(.system(size: 28, weight: .semibold))
+                        .foregroundStyle(.white)
+                )
+
             VStack(alignment: .leading, spacing: 6) {
-                HStack(spacing: 10) {
+                HStack(spacing: 8) {
                     Text(source.displayName)
-                        .font(.system(size: 26, weight: .semibold))
+                        .font(.system(size: 25, weight: .semibold))
                         .lineLimit(1)
                     if isConnected {
                         Circle()
                             .fill(Color.green)
-                            .frame(width: 9, height: 9)
+                            .frame(width: 8, height: 8)
                     }
                 }
-                Text("\(source.protocolType.rawValue.uppercased()) · \(source.host)\(source.port.map { ":\($0)" } ?? "")")
-                    .font(.system(size: 18))
+                Text("\(source.protocolType.rawValue.uppercased()) · \(source.host)")
+                    .font(.system(size: 17))
                     .foregroundStyle(TVTheme.secondaryText)
                     .lineLimit(1)
             }
             Spacer()
+            Image(systemName: "chevron.right")
+                .font(.system(size: 18, weight: .semibold))
+                .foregroundStyle(.white.opacity(0.35))
         }
-        .padding(22)
-        .frame(height: 118)
+        .padding(.horizontal, 22)
+        .padding(.vertical, 20)
+        .frame(height: 124)
     }
 }
 
@@ -224,27 +369,70 @@ struct ContinueWatchingCard: View {
     let record: PlaybackHistoryRecord
     var barColor: Color = TVTheme.accent
 
+    private var badges: [VideoBadge] {
+        Array(VideoBadgeParser.badges(for: record.fileName).prefix(3))
+    }
+
     var body: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            Text(record.fileName)
-                .font(.system(size: 22, weight: .semibold))
-                .lineLimit(2)
-                .frame(width: 360, height: 62, alignment: .leading)
-            ProgressView(value: min(max(record.progressRatio, 0), 1))
-                .tint(barColor)
-                .frame(width: 360)
-            Text("剩余 \(formatted(record.remainingSeconds))")
-                .font(.system(size: 16))
-                .foregroundStyle(TVTheme.tertiaryText)
+        ZStack(alignment: .bottomLeading) {
+            LinearGradient(
+                colors: [
+                    Color(red: 0.08, green: 0.13, blue: 0.24),
+                    Color(red: 0.05, green: 0.07, blue: 0.13)
+                ],
+                startPoint: .topLeading,
+                endPoint: .bottomTrailing
+            )
+
+            RadialGradient(
+                colors: [barColor.opacity(0.18), .clear],
+                center: .topTrailing,
+                startRadius: 10,
+                endRadius: 280
+            )
+
+            VStack(alignment: .leading, spacing: 12) {
+                HStack {
+                    if !badges.isEmpty {
+                        BadgeRow(badges: badges)
+                    }
+                    Spacer()
+                    Image(systemName: "play.circle.fill")
+                        .font(.system(size: 30))
+                        .foregroundStyle(.white.opacity(0.85))
+                }
+
+                Spacer()
+
+                Text(record.fileName)
+                    .font(.system(size: 22, weight: .semibold))
+                    .lineLimit(2)
+                    .multilineTextAlignment(.leading)
+
+                GeometryReader { proxy in
+                    ZStack(alignment: .leading) {
+                        Capsule().fill(Color.white.opacity(0.16))
+                        Capsule()
+                            .fill(barColor)
+                            .frame(width: max(0, proxy.size.width * min(max(record.progressRatio, 0), 1)))
+                    }
+                }
+                .frame(height: 4)
+
+                Text("剩余 \(formatted(record.remainingSeconds))")
+                    .font(.system(size: 15, weight: .medium))
+                    .foregroundStyle(TVTheme.secondaryText)
+            }
+            .padding(22)
         }
-        .padding(18)
-        .frame(width: 396)
+        .frame(width: 420, height: 236)
+        .clipShape(RoundedRectangle(cornerRadius: 24, style: .continuous))
     }
 
     private func formatted(_ seconds: TimeInterval) -> String {
         let total = Int(max(0, seconds))
         let h = total / 3600
         let m = (total % 3600) / 60
-        return h > 0 ? "\(h) 小时 \(m) 分" : "\(m) 分"
+        return h > 0 ? "\(h) 小时 \(m) 分" : "\(max(1, m)) 分钟"
     }
 }

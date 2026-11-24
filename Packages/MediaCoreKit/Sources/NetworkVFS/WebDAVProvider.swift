@@ -491,10 +491,21 @@ public final class WebDAVProvider: VFSProvider, @unchecked Sendable {
         let includeAuth = isSameOriginAsBase(url)
         let req = makeAuthorizedRequest(url: url, method: "HEAD", includeAuth: includeAuth)
         let res = try await performHTTPRequest(session: session, request: req)
-        if let size = extractTotalSize(from: res.response) {
+        let status = res.response.statusCode
+        if (200...299).contains(status), let size = extractTotalSize(from: res.response) {
             return size
         }
-        throw VFSError.httpError(statusCode: res.response.statusCode, message: "Unable to probe content length")
+        if status == 405 || status == 501 {
+            var rangeReq = makeAuthorizedRequest(url: url, method: "GET", includeAuth: includeAuth)
+            rangeReq.setValue("bytes=0-0", forHTTPHeaderField: "Range")
+            let probe = try await performHTTPRequest(session: session, request: rangeReq)
+            if (200...299).contains(probe.response.statusCode),
+               let size = extractTotalSize(from: probe.response) {
+                return size
+            }
+            throw VFSError.httpError(statusCode: probe.response.statusCode, message: "Range probe failed")
+        }
+        throw VFSError.httpError(statusCode: status, message: "Unable to probe content length")
     }
 
     private func extractTotalSize(from response: HTTPURLResponse) -> Int64? {
@@ -522,7 +533,7 @@ public final class WebDAVProvider: VFSProvider, @unchecked Sendable {
 
         let basePath = components.path.hasSuffix("/") ? String(components.path.dropLast()) : components.path
         let cleanPath: String
-        if path.hasPrefix(basePath) && !basePath.isEmpty && basePath != "/" {
+        if !basePath.isEmpty && basePath != "/" && (path == basePath || path.hasPrefix(basePath + "/")) {
             cleanPath = path
         } else {
             let sub = path.hasPrefix("/") ? path : "/" + path

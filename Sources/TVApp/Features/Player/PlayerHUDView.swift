@@ -3,8 +3,13 @@ import AppPreferences
 
 struct PlayerHUDView: View {
     @ObservedObject var engine: PlaybackCoordinator
+    let title: String
     let settings: AppSettings
+    let hasPrevious: Bool
+    let hasNext: Bool
     let onTogglePlay: () -> Void
+    let onPreviousEpisode: () -> Void
+    let onNextEpisode: () -> Void
     let onSeek: (TimeInterval) -> Void
     let onOpenSubtitles: () -> Void
     let onOpenAudioAndEngine: () -> Void
@@ -19,8 +24,45 @@ struct PlayerHUDView: View {
     private var stepInt: Int { max(5, Int(settings.shortSeekSeconds)) }
 
     var body: some View {
-        VStack(spacing: 14) {
-            HStack(alignment: .center, spacing: 18) {
+        VStack(alignment: .leading, spacing: 14) {
+            HStack(alignment: .center, spacing: 16) {
+                Text(title)
+                    .font(.system(size: 20, weight: .semibold))
+                    .foregroundStyle(.white.opacity(0.92))
+                    .lineLimit(1)
+
+                Spacer()
+
+                if abs(engine.playbackRate - 1.0) > 0.01 {
+                    Text(String(format: "%.2gx", engine.playbackRate))
+                        .font(.system(size: 15, weight: .bold, design: .monospaced))
+                        .foregroundStyle(.black)
+                        .padding(.horizontal, 10)
+                        .padding(.vertical, 4)
+                        .background(TVTheme.accent, in: Capsule())
+                }
+
+                if engine.aspectMode != .fit {
+                    Text(engine.aspectMode.rawValue)
+                        .font(.system(size: 14, weight: .semibold))
+                        .foregroundStyle(TVTheme.secondaryText)
+                        .padding(.horizontal, 10)
+                        .padding(.vertical, 4)
+                        .background(Color.white.opacity(0.12), in: Capsule())
+                }
+            }
+
+            HStack(alignment: .center, spacing: 16) {
+                if hasPrevious {
+                    Button(action: onPreviousEpisode) {
+                        Image(systemName: "backward.end.fill")
+                            .font(.system(size: 22))
+                            .frame(width: 48, height: 48)
+                    }
+                    .buttonStyle(.bordered)
+                    .clipShape(Circle())
+                }
+
                 Button(action: onTogglePlay) {
                     Image(systemName: engine.isPlaying ? "pause.fill" : "play.fill")
                         .font(.system(size: 30))
@@ -28,6 +70,16 @@ struct PlayerHUDView: View {
                 }
                 .buttonStyle(.borderedProminent)
                 .clipShape(Circle())
+
+                if hasNext {
+                    Button(action: onNextEpisode) {
+                        Image(systemName: "forward.end.fill")
+                            .font(.system(size: 22))
+                            .frame(width: 48, height: 48)
+                    }
+                    .buttonStyle(.bordered)
+                    .clipShape(Circle())
+                }
 
                 Text(timeText(engine.currentTime))
                     .font(.system(size: 22, weight: .semibold, design: .monospaced))
@@ -43,12 +95,12 @@ struct PlayerHUDView: View {
                 .buttonStyle(.bordered)
 
                 Button(action: onOpenAudioAndEngine) {
-                    Label("音轨/引擎", systemImage: "hifispeaker.2")
+                    Label("画面与音轨", systemImage: "slider.horizontal.3")
                 }
                 .buttonStyle(.bordered)
 
                 Button(action: onToggleStats) {
-                    Label("性能", systemImage: "waveform.path.ecg")
+                    Label("信息", systemImage: "info.circle")
                 }
                 .buttonStyle(.bordered)
 

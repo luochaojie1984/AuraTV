@@ -58,7 +58,7 @@ struct FileBrowserView: View {
 
     var body: some View {
         ZStack {
-            TVTheme.backdrop.ignoresSafeArea()
+            TVTheme.cinemaBackdrop.ignoresSafeArea()
 
             VStack(spacing: 0) {
                 topBar
@@ -297,7 +297,7 @@ struct FileBrowserView: View {
                     BadgeRow(badges: VideoBadgeParser.badges(for: focused.name))
                 }
             } else {
-                Text("把遥控器移到左侧条目上查看完整文件名与路径（超长中日文不截断）。")
+                Text("移动焦点以查看文件详情")
                     .font(.system(size: 18))
                     .foregroundStyle(TVTheme.tertiaryText)
             }
@@ -353,10 +353,12 @@ struct FileBrowserView: View {
             Task { await reload(path: item.path) }
         } else if item.isVideo {
             let resumeAt = env.resumePosition(for: activeSource.id, filePath: item.path)
+            let episodes = visibleItems.filter(\.isVideo)
             playbackRequest = PlaybackRequest(
                 source: activeSource,
                 item: item,
-                resumeAt: resumeAt
+                resumeAt: resumeAt,
+                playlist: episodes
             )
         }
     }

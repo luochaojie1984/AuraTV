@@ -19,6 +19,7 @@ private final class MockWebDAVServer: @unchecked Sendable {
     private(set) var token1Hits: Int = 0
     private(set) var token2Hits: Int = 0
     var expireToken1AfterHits: Int = 2
+    var return405OnHeadForCDN: Bool = false
 
     init(mediaData: Data) throws {
         self.mediaData = mediaData
@@ -127,6 +128,24 @@ private final class MockWebDAVServer: @unchecked Sendable {
             }
         }
 
+        if method == "PROPFIND" && (path == "/dav/dav2/" || path == "/dav/dav2") {
+            let xml = """
+            <?xml version="1.0" encoding="utf-8"?>
+            <D:multistatus xmlns:D="DAV:">
+              <D:response>
+                <D:href>/dav/dav2/</D:href>
+                <D:propstat><D:prop><D:resourcetype><D:collection/></D:resourcetype></D:prop></D:propstat>
+              </D:response>
+              <D:response>
+                <D:href>/dav/dav2/ep01.mkv</D:href>
+                <D:propstat><D:prop><D:resourcetype/><D:getcontentlength>\(mediaData.count)</D:getcontentlength></D:prop></D:propstat>
+              </D:response>
+            </D:multistatus>
+            """
+            sendResponse(fd, status: "207 Multi-Status", headers: ["Content-Type": "application/xml"], body: Data(xml.utf8))
+            return
+        }
+
         if method == "PROPFIND" && (path == "/dav/" || path == "/dav") {
             let xml = """
             <?xml version="1.0" encoding="utf-8"?>
@@ -185,10 +204,14 @@ private final class MockWebDAVServer: @unchecked Sendable {
             }
 
             if method == "HEAD" {
-                sendResponse(fd, status: "200 OK", headers: [
-                    "Content-Length": "\(mediaData.count)",
-                    "Accept-Ranges": "bytes"
-                ], body: Data())
+                if return405OnHeadForCDN {
+                    sendResponse(fd, status: "405 Method Not Allowed", headers: ["Content-Length": "0"], body: Data())
+                } else {
+                    sendResponse(fd, status: "200 OK", headers: [
+                        "Content-Length": "\(mediaData.count)",
+                        "Accept-Ranges": "bytes"
+                    ], body: Data())
+                }
                 return
             }
 
@@ -289,5 +312,27 @@ final class WebDAVProviderTests: XCTestCase {
         XCTAssertEqual(r3, Data(payload[8192..<10240]))
         XCTAssertEqual(server.redirectTriggerHits, 2, "Expired 403 must trigger single 302 refresh")
         XCTAssertEqual(server.token2Hits, 1)
+    }
+
+    func testPrefixBoundaryForDav2And405HeadRangeFallback() async throws {
+        let payload = Data((0..<8192).map { UInt8(($0 * 13 + 5) & 0xFF) })
+        let server = try MockWebDAVServer(mediaData: payload)
+        server.return405OnHeadForCDN = true
+        defer { server.stop() }
+
+        let baseURL = URL(string: "http://127.0.0.1:\(server.port)/dav/")!
+        let provider = WebDAVProvider(baseURL: baseURL, username: "admin", password: "secret")
+
+        // Relative "/dav2" under basePath "/dav" MUST become "/dav/dav2/", not "/dav2/"!
+        let items = try await provider.listDirectory(at: "/dav2")
+        XCTAssertEqual(items.map(\.name), ["ep01.mkv"])
+
+        // 1st open caches 302 target using 405 Range fallback
+        let s1 = try await provider.openStream(at: "/dav/dav2/ep01.mkv")
+        XCTAssertEqual(s1.totalSize, Int64(payload.count))
+
+        // 2nd open hits cached direct URL and ALSO succeeds when HEAD returns 405!
+        let s2 = try await provider.openStream(at: "/dav/dav2/ep01.mkv")
+        XCTAssertEqual(s2.totalSize, Int64(payload.count))
     }
 }

@@ -14,6 +14,7 @@ final class AppSettingsTests: XCTestCase {
         XCTAssertEqual(settings.scrubBarHeight, 5.0, accuracy: 0.001)
         XCTAssertTrue(settings.showScrubTimeText)
         XCTAssertTrue(settings.enableResumePlayback)
+        XCTAssertTrue(settings.autoPlayNextEpisode)
         XCTAssertTrue(settings.enableUISoundEffects)
         XCTAssertEqual(settings.readAheadCacheLimitMB, 96)
 
@@ -36,6 +37,7 @@ final class AppSettingsTests: XCTestCase {
         XCTAssertEqual(decoded.longPressSpeedProfile, .mxStandard)
         XCTAssertTrue(decoded.enableTouchpadScrub)
         XCTAssertTrue(decoded.enableResumePlayback)
+        XCTAssertTrue(decoded.autoPlayNextEpisode)
         XCTAssertTrue(decoded.enableUISoundEffects)
         XCTAssertEqual(decoded.scrubBarColorHex, "#38BDF8")
         XCTAssertEqual(decoded.readAheadCacheLimitMB, 128)

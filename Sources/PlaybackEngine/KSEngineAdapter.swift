@@ -49,6 +49,8 @@ public final class KSEngineAdapter: NSObject, ObservableObject, PlayerEngineProt
     @Published public private(set) var layerRevision: Int = 0
 
     public private(set) var playbackRate: Float = 1.0
+    @Published public private(set) var aspectMode: VideoAspectMode = .fit
+    public var onPlaybackEnded: (@MainActor () -> Void)?
     public private(set) var videoFormatDescription: CMFormatDescription?
 
     private var playerLayer: KSPlayerLayer?
@@ -166,6 +168,20 @@ public final class KSEngineAdapter: NSObject, ObservableObject, PlayerEngineProt
         playerLayer?.player.playbackRate = rate
     }
 
+    public func setAspectMode(_ mode: VideoAspectMode) {
+        aspectMode = mode
+        applyAspectModeToLayer()
+    }
+
+    private func applyAspectModeToLayer() {
+        guard let player = playerLayer?.player else { return }
+        switch aspectMode {
+        case .fit:     player.contentMode = .scaleAspectFit
+        case .fill:    player.contentMode = .scaleAspectFill
+        case .stretch: player.contentMode = .scaleToFill
+        }
+    }
+
     public func selectAudioTrack(id: Int32) {
         guard let player = playerLayer?.player else { return }
         if let match = player.tracks(mediaType: .audio).first(where: { $0.trackID == id }) {
@@ -257,6 +273,8 @@ public final class KSEngineAdapter: NSObject, ObservableObject, PlayerEngineProt
         isPlaying = state.isPlaying
         if state == .readyToPlay {
             duration = layer.player.duration
+            applyAspectModeToLayer()
+            layer.player.playbackRate = playbackRate
             refreshTracks()
             if let videoTrack = layer.player.tracks(mediaType: .video).first,
                let desc = videoTrack.formatDescription {
@@ -291,6 +309,8 @@ public final class KSEngineAdapter: NSObject, ObservableObject, PlayerEngineProt
         } else if let cont = loadContinuation {
             loadContinuation = nil
             cont.resume()
+        } else {
+            onPlaybackEnded?()
         }
     }
 

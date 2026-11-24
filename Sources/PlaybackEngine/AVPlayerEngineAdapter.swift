@@ -16,6 +16,7 @@ public final class AVPlayerEngineAdapter: NSObject, ObservableObject, PlayerEngi
     private let player = AVPlayer()
     private var currentItem: AVPlayerItem?
     nonisolated(unsafe) private var timeObserver: Any?
+    nonisolated(unsafe) private var endObserver: NSObjectProtocol?
     private var loadedDuration: TimeInterval = 0
     private var readBytes: Int64 = 0
     private var loadStart: Date?
@@ -26,6 +27,8 @@ public final class AVPlayerEngineAdapter: NSObject, ObservableObject, PlayerEngi
     /// Kept so `AVDisplayCriteria` can be built with the real format description.
     public private(set) var videoFormatDescription: CMFormatDescription?
     public private(set) var playbackRate: Float = 1.0
+    @Published public private(set) var aspectMode: VideoAspectMode = .fit
+    public var onPlaybackEnded: (@MainActor () -> Void)?
     @Published public private(set) var audioTracks: [EngineTrackInfo] = []
     @Published public private(set) var embeddedSubtitleTracks: [EngineTrackInfo] = []
 
@@ -46,6 +49,9 @@ public final class AVPlayerEngineAdapter: NSObject, ObservableObject, PlayerEngi
         if let timeObserver {
             player.removeTimeObserver(timeObserver)
         }
+        if let endObserver {
+            NotificationCenter.default.removeObserver(endObserver)
+        }
     }
 
     private func installTimeObserver() {
@@ -64,6 +70,21 @@ public final class AVPlayerEngineAdapter: NSObject, ObservableObject, PlayerEngi
         let asset = AVURLAsset(url: url, options: [AVURLAssetPreferPreciseDurationAndTimingKey: true])
         let item = AVPlayerItem(asset: asset)
         item.preferredForwardBufferDuration = 6
+        if let endObserver {
+            NotificationCenter.default.removeObserver(endObserver)
+            self.endObserver = nil
+        }
+        endObserver = NotificationCenter.default.addObserver(
+            forName: .AVPlayerItemDidPlayToEndTime,
+            object: item,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                self.isPlaying = false
+                self.onPlaybackEnded?()
+            }
+        }
         currentItem = item
         player.replaceCurrentItem(with: item)
 
@@ -125,6 +146,10 @@ public final class AVPlayerEngineAdapter: NSObject, ObservableObject, PlayerEngi
     }
 
     public func shutdown() {
+        if let endObserver {
+            NotificationCenter.default.removeObserver(endObserver)
+            self.endObserver = nil
+        }
         player.pause()
         player.replaceCurrentItem(with: nil)
         currentItem = nil
@@ -224,6 +249,19 @@ public final class AVPlayerEngineAdapter: NSObject, ObservableObject, PlayerEngi
         if isPlaying {
             player.rate = rate
         }
+    }
+
+    public var currentVideoGravity: AVLayerVideoGravity {
+        switch aspectMode {
+        case .fit:     return .resizeAspect
+        case .fill:    return .resizeAspectFill
+        case .stretch: return .resize
+        }
+    }
+
+    public func setAspectMode(_ mode: VideoAspectMode) {
+        aspectMode = mode
+        hostLayer.videoGravity = currentVideoGravity
     }
 
     public func selectAudioTrack(id: Int32) {

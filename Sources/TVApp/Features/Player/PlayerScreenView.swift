@@ -1,4 +1,5 @@
 import SwiftUI
+import UIKit
 import AVFoundation
 import NetworkVFS
 import SubtitleKit
@@ -11,6 +12,7 @@ final class PlayerHostView: UIView {
 
 struct PlayerLayerRepresentable: UIViewRepresentable {
     let playerLayer: AVPlayerLayer
+    let videoGravity: AVLayerVideoGravity
 
     func makeUIView(context: Context) -> PlayerHostView {
         let view = PlayerHostView()
@@ -22,7 +24,9 @@ struct PlayerLayerRepresentable: UIViewRepresentable {
         if uiView.playerLayer.player !== playerLayer.player {
             uiView.playerLayer.player = playerLayer.player
         }
-        uiView.playerLayer.videoGravity = .resizeAspect
+        if uiView.playerLayer.videoGravity != videoGravity {
+            uiView.playerLayer.videoGravity = videoGravity
+        }
     }
 }
 
@@ -35,13 +39,22 @@ struct PlayerScreenView: View {
     @StateObject private var engine = PlaybackCoordinator()
     @StateObject private var scrub = MXScrubController()
 
+    @State private var currentItem: VFSFileItem
+    @State private var activeProvider: (any VFSProvider)?
     @State private var scrubEngine = LiveKeyframeScrubEngine()
     @State private var scrubPrepareTask: Task<Void, Never>?
     @State private var activeStreamToken: String?
     @State private var activeStreamURL: URL?
     @State private var enginePreference: PreferredEngineChoice = .auto
+
+    @State private var availableExternalSubtitles: [MatchedSubtitleCandidate] = []
+    @State private var selectedExternalSubtitlePath: String?
     @State private var subtitleTrack: ParsedSubtitleTrack?
     @State private var suppressExternalSubtitle: Bool = false
+
+    @State private var isLoadingMedia = true
+    @State private var nextEpisodeCountdown: Int?
+    @State private var nextEpisodeTask: Task<Void, Never>?
     @State private var topNotice: String?
     @State private var showHUD = false
     @State private var showSubtitleDrawer = false
@@ -55,8 +68,27 @@ struct PlayerScreenView: View {
     @State private var lastReportedSecond: Int = -1
     @State private var didShutdown: Bool = false
 
+    init(request: PlaybackRequest) {
+        self.request = request
+        self._currentItem = State(initialValue: request.item)
+    }
+
     private var style: SubtitleStyleConfig { env.settings.subtitleStyle }
     private var anyDrawerOpen: Bool { showSubtitleDrawer || showAudioDrawer }
+
+    private var currentPlaylistIndex: Int? {
+        request.playlist.firstIndex(where: { $0.path == currentItem.path })
+    }
+
+    private var previousEpisode: VFSFileItem? {
+        guard let idx = currentPlaylistIndex, idx > 0 else { return nil }
+        return request.playlist[idx - 1]
+    }
+
+    private var nextEpisode: VFSFileItem? {
+        guard let idx = currentPlaylistIndex, idx + 1 < request.playlist.count else { return nil }
+        return request.playlist[idx + 1]
+    }
 
     var body: some View {
         ZStack {
@@ -67,15 +99,20 @@ struct PlayerScreenView: View {
                 KSLayerRepresentable(adapter: engine.ksAdapter)
                     .ignoresSafeArea()
             } else {
-                PlayerLayerRepresentable(playerLayer: engine.avAdapter.playerLayer)
-                    .ignoresSafeArea()
+                PlayerLayerRepresentable(
+                    playerLayer: engine.avAdapter.playerLayer,
+                    videoGravity: engine.avAdapter.currentVideoGravity
+                )
+                .ignoresSafeArea()
             }
             #else
-            PlayerLayerRepresentable(playerLayer: engine.avAdapter.playerLayer)
-                .ignoresSafeArea()
+            PlayerLayerRepresentable(
+                playerLayer: engine.avAdapter.playerLayer,
+                videoGravity: engine.avAdapter.currentVideoGravity
+            )
+            .ignoresSafeArea()
             #endif
 
-            // Direct CoreAnimation CALayer live-frame display (<0.1ms swap, ZERO SwiftUI view-tree diffing!)
             ScrubFrameDisplayView(presenter: scrub.framePresenter)
                 .ignoresSafeArea()
                 .allowsHitTesting(false)
@@ -88,7 +125,7 @@ struct PlayerScreenView: View {
             .ignoresSafeArea()
 
             RemoteKeyCaptureView(
-                isCaptureEnabled: !showHUD && !anyDrawerOpen && loadError == nil,
+                isCaptureEnabled: !showHUD && !anyDrawerOpen && loadError == nil && nextEpisodeCountdown == nil,
                 enableTouchpadScrub: env.settings.enableTouchpadScrub,
                 onShortPress: { dir in
                     handleShortPress(dir)
@@ -140,9 +177,8 @@ struct PlayerScreenView: View {
                 }
             )
             .ignoresSafeArea()
-            .allowsHitTesting(!showHUD && !anyDrawerOpen && loadError == nil)
+            .allowsHitTesting(!showHUD && !anyDrawerOpen && loadError == nil && nextEpisodeCountdown == nil)
 
-            // Top stats & HUD overlay
             VStack {
                 if showStats {
                     statsBar
@@ -151,8 +187,21 @@ struct PlayerScreenView: View {
                 if showHUD {
                     PlayerHUDView(
                         engine: engine,
+                        title: currentItem.name,
                         settings: env.settings,
+                        hasPrevious: previousEpisode != nil,
+                        hasNext: nextEpisode != nil,
                         onTogglePlay: { togglePlayback() },
+                        onPreviousEpisode: {
+                            if let prev = previousEpisode {
+                                Task { await switchToEpisode(prev) }
+                            }
+                        },
+                        onNextEpisode: {
+                            if let next = nextEpisode {
+                                Task { await switchToEpisode(next) }
+                            }
+                        },
                         onSeek: { seconds in
                             Task { await engine.seek(to: seconds, precise: true) }
                         },
@@ -175,7 +224,6 @@ struct PlayerScreenView: View {
                 }
             }
 
-            // Ultra-thin MX Player-style translucent progress bar pinned flush to the bottom edge
             if !showHUD && (scrub.isShowingBar || isFastPlaying) {
                 VStack {
                     Spacer()
@@ -186,13 +234,73 @@ struct PlayerScreenView: View {
                 .allowsHitTesting(false)
             }
 
+            if isLoadingMedia && loadError == nil {
+                VStack(spacing: 14) {
+                    ProgressView()
+                        .scaleEffect(1.3)
+                    Text(currentItem.name)
+                        .font(.system(size: 20, weight: .medium))
+                        .foregroundStyle(.white.opacity(0.9))
+                        .lineLimit(1)
+                        .frame(maxWidth: 680)
+                }
+                .padding(.horizontal, 34)
+                .padding(.vertical, 24)
+                .tvGlassSurface(cornerRadius: 22)
+                .transition(.opacity)
+            }
+
+            if let countdown = nextEpisodeCountdown, let nextEp = nextEpisode {
+                VStack {
+                    Spacer()
+                    HStack {
+                        Spacer()
+                        VStack(alignment: .leading, spacing: 12) {
+                            Text("即将播放下一集（\(countdown)s）")
+                                .font(.system(size: 16, weight: .semibold))
+                                .foregroundStyle(TVTheme.accent)
+                            Text(nextEp.name)
+                                .font(.system(size: 20, weight: .semibold))
+                                .lineLimit(2)
+                            HStack(spacing: 12) {
+                                Button("立即播放") {
+                                    cancelNextEpisodeCountdown()
+                                    Task { await switchToEpisode(nextEp) }
+                                }
+                                .buttonStyle(TVOptionButtonStyle())
+                                .padding(.horizontal, 16)
+                                .padding(.vertical, 8)
+                                .background(TVTheme.accent.opacity(0.45), in: Capsule())
+
+                                Button("取消") {
+                                    cancelNextEpisodeCountdown()
+                                }
+                                .buttonStyle(TVOptionButtonStyle())
+                                .padding(.horizontal, 16)
+                                .padding(.vertical, 8)
+                                .background(Color.white.opacity(0.12), in: Capsule())
+                            }
+                        }
+                        .padding(24)
+                        .frame(width: 460, alignment: .leading)
+                        .tvGlassSurface(cornerRadius: 22)
+                    }
+                    .padding(.trailing, 54)
+                    .padding(.bottom, 46)
+                }
+                .transition(.move(edge: .trailing).combined(with: .opacity))
+            }
+
             if showSubtitleDrawer {
                 HStack {
                     Spacer()
                     SubtitleSettingsDrawer(
                         style: style,
-                        subtitleName: subtitleTrack.map { "\($0.format.uppercased()) · \($0.cues.count) 条" },
-                        hasSubtitle: subtitleTrack != nil,
+                        externalSubtitles: availableExternalSubtitles,
+                        selectedExternalPath: selectedExternalSubtitlePath,
+                        onSelectExternalSubtitle: { candidate in
+                            Task { await selectExternalSubtitle(candidate) }
+                        },
                         onStyleChange: { mutate in
                             Task { await env.updateSubtitleStyle(mutate) }
                         },
@@ -214,6 +322,14 @@ struct PlayerScreenView: View {
                         embeddedSubtitleTracks: engine.embeddedSubtitleTracks,
                         activeEngineKind: engine.activeEngineKind,
                         currentPreference: enginePreference,
+                        playbackRate: engine.playbackRate,
+                        aspectMode: engine.aspectMode,
+                        onSelectRate: { rate in
+                            engine.setPlaybackRate(rate)
+                        },
+                        onSelectAspectMode: { mode in
+                            engine.setAspectMode(mode)
+                        },
                         onSelectAudio: { id in
                             engine.selectAudioTrack(id: id)
                         },
@@ -271,13 +387,30 @@ struct PlayerScreenView: View {
                 .tvGlassSurface(cornerRadius: 24)
             }
         }
-        .task { await startPlayback() }
+        .task {
+            engine.onPlaybackEnded = {
+                handlePlaybackEnded()
+            }
+            await startPlayback(item: currentItem, startAt: request.resumeAt)
+        }
         .onChange(of: engine.currentTime) { _, newValue in
             persistProgress(newValue)
+        }
+        .onChange(of: engine.isPlaying) { _, _ in
+            updateIdleTimer()
+        }
+        .onChange(of: scrub.isScrubbing) { _, _ in
+            updateIdleTimer()
+        }
+        .onChange(of: isLoadingMedia) { _, _ in
+            updateIdleTimer()
         }
         .onExitCommand {
             if scrub.isScrubbing {
                 commitActiveScrub()
+            } else if nextEpisodeCountdown != nil {
+                UISoundPlayer.shared.playBack()
+                cancelNextEpisodeCountdown()
             } else if showSubtitleDrawer {
                 UISoundPlayer.shared.playBack()
                 showSubtitleDrawer = false
@@ -296,6 +429,11 @@ struct PlayerScreenView: View {
         .onDisappear {
             shutdown()
         }
+    }
+
+    private func updateIdleTimer() {
+        let keepAwake = !didShutdown && (engine.isPlaying || scrub.isScrubbing || isLoadingMedia)
+        UIApplication.shared.isIdleTimerDisabled = keepAwake
     }
 
     private var statsBar: some View {
@@ -319,7 +457,6 @@ struct PlayerScreenView: View {
         .padding(.top, 30)
     }
 
-    /// Ultra-thin MX Player-style transparent progress bar at the very bottom edge (minimal video obstruction).
     private var mxBottomScrubBar: some View {
         let barColor = Color(hex: env.settings.scrubBarColorHex)
         let barOpacity = env.settings.scrubBarOpacity
@@ -369,40 +506,46 @@ struct PlayerScreenView: View {
         }
     }
 
-    private func startPlayback() async {
+    private func startPlayback(item: VFSFileItem, startAt: TimeInterval) async {
+        isLoadingMedia = true
+        loadError = nil
+        updateIdleTimer()
+
         do {
-            let activeProvider: any VFSProvider
+            let provider: any VFSProvider
             let stream: any VFSRandomAccessStream
             do {
                 let p = try await env.connectedProvider(for: request.source)
-                stream = try await p.openStream(at: request.item.path)
-                activeProvider = p
+                stream = try await p.openStream(at: item.path)
+                provider = p
             } catch {
-                // Transparently reconnect once if cached SMB/WebDAV session idled out
                 let p = try await env.connectedProvider(for: request.source, forceReconnect: true)
-                stream = try await p.openStream(at: request.item.path)
-                activeProvider = p
+                stream = try await p.openStream(at: item.path)
+                provider = p
             }
+            self.activeProvider = provider
 
             let cacheConfig = StreamCacheConfiguration(
                 maxCacheBytes: env.settings.readAheadCacheLimitMB * 1024 * 1024
             )
             let registered = try env.proxy.register(
                 stream: stream,
-                fileName: request.item.name,
+                fileName: item.name,
                 wrapWithReadAheadCache: true,
                 cacheConfig: cacheConfig
             )
             self.activeStreamToken = registered.token
             self.activeStreamURL = registered.url
 
-            let effectiveStartAt = env.settings.enableResumePlayback ? request.resumeAt : 0
+            let effectiveStartAt = env.settings.enableResumePlayback ? startAt : 0
             try await engine.load(
                 url: registered.url,
-                fileName: request.item.name,
+                fileName: item.name,
                 startAt: effectiveStartAt,
                 preference: enginePreference
             )
+            isLoadingMedia = false
+
             if engine.activeEngineKind == .avPlayer {
                 DisplayModeCoordinator.shared.apply(
                     refreshRate: Float(engine.currentStats().frameRate),
@@ -414,7 +557,6 @@ struct PlayerScreenView: View {
                 showTopNotice("已从 \(formatTime(effectiveStartAt)) 继续播放")
             }
 
-            // Warm up dedicated hardware keyframe scrub engine silently in background
             let localScrub = scrubEngine
             let streamURL = registered.url
             scrubPrepareTask?.cancel()
@@ -422,10 +564,57 @@ struct PlayerScreenView: View {
                 await localScrub.prepare(url: streamURL)
             }
             scheduleHUDHide()
-            await loadSubtitles(provider: activeProvider)
+            await loadSubtitles(provider: provider, for: item)
         } catch {
+            isLoadingMedia = false
             loadError = error.localizedDescription
         }
+    }
+
+    private func switchToEpisode(_ item: VFSFileItem) async {
+        cancelNextEpisodeCountdown()
+        scrubPrepareTask?.cancel()
+        scrub.cancelAll()
+        if let token = activeStreamToken {
+            env.proxy.setScrubMode(false, for: token)
+            env.proxy.unregister(token: token)
+            activeStreamToken = nil
+        }
+        await scrubEngine.close()
+        scrubEngine = LiveKeyframeScrubEngine()
+
+        currentItem = item
+        lastReportedSecond = -1
+        availableExternalSubtitles = []
+        selectedExternalSubtitlePath = nil
+        subtitleTrack = nil
+        suppressExternalSubtitle = false
+        showHUD = false
+
+        let resumeAt = env.resumePosition(for: request.source.id, filePath: item.path)
+        await startPlayback(item: item, startAt: resumeAt)
+    }
+
+    private func handlePlaybackEnded() {
+        updateIdleTimer()
+        guard env.settings.autoPlayNextEpisode, nextEpisode != nil else { return }
+        cancelNextEpisodeCountdown()
+        nextEpisodeTask = Task { @MainActor in
+            for remaining in stride(from: 3, through: 1, by: -1) {
+                if Task.isCancelled { return }
+                nextEpisodeCountdown = remaining
+                try? await Task.sleep(nanoseconds: 1_000_000_000)
+            }
+            guard !Task.isCancelled, let ep = nextEpisode else { return }
+            nextEpisodeCountdown = nil
+            await switchToEpisode(ep)
+        }
+    }
+
+    private func cancelNextEpisodeCountdown() {
+        nextEpisodeTask?.cancel()
+        nextEpisodeTask = nil
+        nextEpisodeCountdown = nil
     }
 
     private func switchEngine(to choice: PreferredEngineChoice) async {
@@ -436,7 +625,7 @@ struct PlayerScreenView: View {
         do {
             try await engine.load(
                 url: url,
-                fileName: request.item.name,
+                fileName: currentItem.name,
                 startAt: currentPos,
                 preference: choice
             )
@@ -451,8 +640,8 @@ struct PlayerScreenView: View {
         }
     }
 
-    private func loadSubtitles(provider: any VFSProvider) async {
-        let directory = (request.item.path as NSString).deletingLastPathComponent
+    private func loadSubtitles(provider: any VFSProvider, for item: VFSFileItem) async {
+        let directory = (item.path as NSString).deletingLastPathComponent
         let base = directory.isEmpty ? "/" : directory
         do {
             let entries = try await provider.listDirectory(at: base)
@@ -473,17 +662,43 @@ struct PlayerScreenView: View {
             }
 
             let candidates = SubtitleMatcher.match(
-                videoFileName: request.item.name,
+                videoFileName: item.name,
                 sameDirectoryFiles: sameDir,
                 subfolderFiles: folderFiles
             )
+            availableExternalSubtitles = candidates
             guard let best = candidates.first else { return }
-            let data = try await provider.readFileData(at: best.path, maxBytes: 8 * 1024 * 1024)
-            let parsed = SubtitleParser.parse(data: data, fileExtension: best.formatExtension)
-            subtitleTrack = parsed.track
-            showTopNotice("已自动加载外挂字幕：\(best.name)")
+            await selectExternalSubtitle(best, showBanner: true)
         } catch {
             // Subtitles are optional; playback must never fail because of them.
+        }
+    }
+
+    private func selectExternalSubtitle(_ candidate: MatchedSubtitleCandidate?, showBanner: Bool = true) async {
+        guard let candidate else {
+            selectedExternalSubtitlePath = nil
+            subtitleTrack = nil
+            if showBanner { showTopNotice("已关闭外挂字幕") }
+            return
+        }
+        do {
+            let provider: any VFSProvider
+            if let existing = activeProvider {
+                provider = existing
+            } else {
+                provider = try await env.connectedProvider(for: request.source)
+                activeProvider = provider
+            }
+            let data = try await provider.readFileData(at: candidate.path, maxBytes: 8 * 1024 * 1024)
+            let parsed = SubtitleParser.parse(data: data, fileExtension: candidate.formatExtension)
+            selectedExternalSubtitlePath = candidate.path
+            subtitleTrack = parsed.track
+            suppressExternalSubtitle = false
+            if showBanner {
+                showTopNotice("已加载外挂字幕：\(candidate.name)")
+            }
+        } catch {
+            showTopNotice("加载字幕失败：\(error.localizedDescription)")
         }
     }
 
@@ -561,7 +776,6 @@ struct PlayerScreenView: View {
                 commitActiveScrub()
             }
         } else {
-            // Default: fixed 5s-increment step jump with rapid multi-tap coalescing & live frame preview
             enterScrubHardwareStateIfNeeded()
             let token = activeStreamToken
             scrub.triggerShortStep(
@@ -645,12 +859,12 @@ struct PlayerScreenView: View {
         guard engine.duration > 0 else { return }
         let record = PlaybackHistoryRecord(
             sourceID: request.source.id,
-            filePath: request.item.path,
-            fileName: request.item.name,
+            filePath: currentItem.path,
+            fileName: currentItem.name,
             lastPositionSeconds: time,
             durationSeconds: engine.duration,
             lastPlayedAt: Date(),
-            selectedSubtitlePath: nil,
+            selectedSubtitlePath: selectedExternalSubtitlePath,
             selectedAudioTrackID: nil
         )
         Task { await env.recordProgress(record) }
@@ -659,6 +873,8 @@ struct PlayerScreenView: View {
     private func shutdown() {
         guard !didShutdown else { return }
         didShutdown = true
+        UIApplication.shared.isIdleTimerDisabled = false
+        cancelNextEpisodeCountdown()
         hudHideTask?.cancel()
         noticeTask?.cancel()
         scrubPrepareTask?.cancel()
@@ -670,9 +886,9 @@ struct PlayerScreenView: View {
         }
         let localScrub = scrubEngine
         Task { await localScrub.close() }
+        engine.onPlaybackEnded = nil
         engine.shutdown()
         DisplayModeCoordinator.shared.reset()
-        // NOTE: Keep shared LAN provider warm in AppEnvironment so returning to folder & next video needs zero reconnect!
         dismiss()
     }
 

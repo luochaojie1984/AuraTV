@@ -17,13 +17,39 @@ public enum TVTheme {
             endPoint: .bottomTrailing
         )
     }
+
+    /// Deep cinema obsidian backdrop with subtle top aurora glow matching AuraTV's 3D icon.
+    public static var cinemaBackdrop: some View {
+        ZStack {
+            LinearGradient(
+                colors: [
+                    Color(red: 0.024, green: 0.035, blue: 0.067),
+                    Color(red: 0.055, green: 0.082, blue: 0.145)
+                ],
+                startPoint: .top,
+                endPoint: .bottom
+            )
+            RadialGradient(
+                colors: [Color(red: 0.055, green: 0.647, blue: 0.914).opacity(0.16), .clear],
+                center: UnitPoint(x: 0.25, y: 0.06),
+                startRadius: 20,
+                endRadius: 880
+            )
+            RadialGradient(
+                colors: [Color(red: 0.388, green: 0.400, blue: 0.945).opacity(0.14), .clear],
+                center: UnitPoint(x: 0.78, y: 0.18),
+                startRadius: 20,
+                endRadius: 820
+            )
+        }
+    }
 }
 
 public enum TVMetrics {
-    public static let horizontalSafeMargin: CGFloat = 80
-    public static let verticalSafeMargin: CGFloat = 60
+    public static let horizontalSafeMargin: CGFloat = 44
+    public static let verticalSafeMargin: CGFloat = 32
     public static let cardCornerRadius: CGFloat = 22
-    public static let focusScale: CGFloat = 1.04
+    public static let focusScale: CGFloat = 1.045
 }
 
 /// Horizontally scrolls a long CJK title after a short dwell so nothing is ever
