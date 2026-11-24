@@ -492,17 +492,19 @@ public final class LiveKeyframeScrubEngine: @unchecked Sendable {
 }
 
 #else
-/// Simulator fallback backed by `AVAssetImageGenerator` (Swift 6 strict-concurrency safe).
+/// Simulator fallback backed by `AVAssetImageGenerator` (Swift 6 strict-concurrency & async safe).
 public final class LiveKeyframeScrubEngine: @unchecked Sendable {
-    private let stateLock = NSLock()
-    private var generator: AVAssetImageGenerator?
+    private final class GeneratorBox: @unchecked Sendable {
+        let generator: AVAssetImageGenerator
+        init(_ generator: AVAssetImageGenerator) { self.generator = generator }
+    }
+
+    private let boxLock = OSAllocatedUnfairLock<GeneratorBox?>(initialState: nil)
 
     public init() {}
 
     public var isReady: Bool {
-        stateLock.lock()
-        defer { stateLock.unlock() }
-        return generator != nil
+        boxLock.withLock { $0 != nil }
     }
 
     public func resetTracking() {}
@@ -514,19 +516,15 @@ public final class LiveKeyframeScrubEngine: @unchecked Sendable {
         gen.maximumSize = CGSize(width: 960, height: 540)
         gen.requestedTimeToleranceBefore = .positiveInfinity
         gen.requestedTimeToleranceAfter = .positiveInfinity
-        stateLock.lock()
-        generator = gen
-        stateLock.unlock()
+        let box = GeneratorBox(gen)
+        boxLock.withLock { $0 = box }
     }
 
     public func decodePreviewFrame(at targetTime: TimeInterval) async -> ScrubDecodeOutcome {
-        stateLock.lock()
-        let gen = generator
-        stateLock.unlock()
-        guard let gen else { return .unavailable }
+        guard let box = boxLock.withLock({ $0 }) else { return .unavailable }
         let cmTime = CMTime(seconds: max(0, targetTime), preferredTimescale: 600)
         do {
-            let (image, actual) = try await gen.image(at: cmTime)
+            let (image, actual) = try await box.generator.image(at: cmTime)
             let sec = actual.isNumeric ? actual.seconds : targetTime
             return .frame(ScrubPreviewFrame(cgImage: image, actualTime: sec))
         } catch {
@@ -535,11 +533,12 @@ public final class LiveKeyframeScrubEngine: @unchecked Sendable {
     }
 
     public func close() async {
-        stateLock.lock()
-        let gen = generator
-        generator = nil
-        stateLock.unlock()
-        gen?.cancelAllCGImageGeneration()
+        let box = boxLock.withLock { current -> GeneratorBox? in
+            let saved = current
+            current = nil
+            return saved
+        }
+        box?.generator.cancelAllCGImageGeneration()
     }
 }
 #endif
