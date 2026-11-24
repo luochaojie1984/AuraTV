@@ -45,6 +45,7 @@ jobs:
         run: |
           APP="build/Release-appletvos/AuraTV.app"
           test -d "$APP/Frameworks/AMSMB2.framework" || { echo "::error::AMSMB2.framework not embedded"; exit 1; }
+          test -d "$APP/Frameworks/KSPlayer.framework" || { echo "::error::KSPlayer.framework not embedded"; exit 1; }
           /usr/libexec/PlistBuddy -c "Print :NSBonjourServices" "$APP/Info.plist" || { echo "::error::NSBonjourServices missing"; exit 1; }
           /usr/libexec/PlistBuddy -c "Print :CFBundleShortVersionString" "$APP/Info.plist" || { echo "::error::CFBundleShortVersionString missing"; exit 1; }
           echo "frameworks:"; ls "$APP/Frameworks"

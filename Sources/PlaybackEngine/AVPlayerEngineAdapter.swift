@@ -26,6 +26,8 @@ public final class AVPlayerEngineAdapter: NSObject, ObservableObject, PlayerEngi
     /// Kept so `AVDisplayCriteria` can be built with the real format description.
     public private(set) var videoFormatDescription: CMFormatDescription?
     public private(set) var playbackRate: Float = 1.0
+    @Published public private(set) var audioTracks: [EngineTrackInfo] = []
+    @Published public private(set) var embeddedSubtitleTracks: [EngineTrackInfo] = []
 
     public var playerLayer: AVPlayerLayer { hostLayer }
 
@@ -73,6 +75,7 @@ public final class AVPlayerEngineAdapter: NSObject, ObservableObject, PlayerEngi
         if let info = await Self.probeTechnicalInfo(asset: asset) {
             videoFormatDescription = info.formatDescription
             stats = PlaybackStats(
+                engineName: "AVPlayer",
                 videoCodec: info.codec,
                 resolution: "\(info.width)x\(info.height)",
                 dynamicRange: info.dynamicRange,
@@ -177,6 +180,31 @@ public final class AVPlayerEngineAdapter: NSObject, ObservableObject, PlayerEngi
         playbackRate = rate
         if isPlaying {
             player.rate = rate
+        }
+    }
+
+    public func selectAudioTrack(id: Int32) {
+        guard let item = currentItem else { return }
+        Task { @MainActor in
+            if let group = try? await item.asset.loadMediaSelectionGroup(for: .audible) {
+                let idx = Int(id)
+                if idx >= 0 && idx < group.options.count {
+                    item.select(group.options[idx], in: group)
+                }
+            }
+        }
+    }
+
+    public func selectEmbeddedSubtitleTrack(id: Int32?) {
+        guard let item = currentItem else { return }
+        Task { @MainActor in
+            if let group = try? await item.asset.loadMediaSelectionGroup(for: .legible) {
+                if let id, Int(id) >= 0, Int(id) < group.options.count {
+                    item.select(group.options[Int(id)], in: group)
+                } else {
+                    item.select(nil, in: group)
+                }
+            }
         }
     }
 

@@ -32,27 +32,43 @@ struct PlayerScreenView: View {
     @EnvironmentObject private var env: AppEnvironment
     @Environment(\.dismiss) private var dismiss
 
-    @StateObject private var engine = AVPlayerEngineAdapter()
+    @StateObject private var engine = PlaybackCoordinator()
     @StateObject private var scrub = MXScrubController()
 
     @State private var provider: (any VFSProvider)?
+    @State private var activeStreamURL: URL?
+    @State private var enginePreference: PreferredEngineChoice = .auto
     @State private var subtitleTrack: ParsedSubtitleTrack?
     @State private var subtitleNotice: String?
     @State private var showHUD = true
     @State private var showSubtitleDrawer = false
+    @State private var showAudioDrawer = false
     @State private var showStats = false
+    @State private var isFastPlaying = false
+    @State private var fastPlayDirection: ScrubDirection = .forward
     @State private var loadError: String?
     @State private var hudHideTask: Task<Void, Never>?
     @State private var lastReportedSecond: Int = -1
 
     private var style: SubtitleStyleConfig { env.settings.subtitleStyle }
+    private var anyDrawerOpen: Bool { showSubtitleDrawer || showAudioDrawer }
 
     var body: some View {
         ZStack {
             Color.black.ignoresSafeArea()
 
-            PlayerLayerRepresentable(playerLayer: engine.playerLayer)
+            #if canImport(KSPlayer) && !targetEnvironment(simulator)
+            if engine.activeEngineKind == .ksPlayer {
+                KSLayerRepresentable(adapter: engine.ksAdapter)
+                    .ignoresSafeArea()
+            } else {
+                PlayerLayerRepresentable(playerLayer: engine.avAdapter.playerLayer)
+                    .ignoresSafeArea()
+            }
+            #else
+            PlayerLayerRepresentable(playerLayer: engine.avAdapter.playerLayer)
                 .ignoresSafeArea()
+            #endif
 
             SubtitleOverlayView(
                 track: subtitleTrack ?? ParsedSubtitleTrack(cues: [], format: "empty"),
@@ -62,7 +78,7 @@ struct PlayerScreenView: View {
             .ignoresSafeArea()
 
             RemoteKeyCaptureView(
-                isCaptureEnabled: !showSubtitleDrawer,
+                isCaptureEnabled: !anyDrawerOpen,
                 onShortPress: { dir in
                     Task { await shortSeek(dir) }
                 },
@@ -78,6 +94,8 @@ struct PlayerScreenView: View {
                 onMenu: {
                     if showSubtitleDrawer {
                         showSubtitleDrawer = false
+                    } else if showAudioDrawer {
+                        showAudioDrawer = false
                     } else {
                         shutdown()
                     }
@@ -92,6 +110,8 @@ struct PlayerScreenView: View {
                 Spacer()
                 if scrub.isScrubbing {
                     scrubPill
+                } else if isFastPlaying {
+                    fastPlayPill
                 }
                 if showHUD {
                     PlayerHUDView(
@@ -102,7 +122,13 @@ struct PlayerScreenView: View {
                             Task { await engine.seek(to: seconds, precise: true) }
                         },
                         onOpenSubtitles: {
+                            showAudioDrawer = false
                             showSubtitleDrawer = true
+                            showHUD = false
+                        },
+                        onOpenAudioAndEngine: {
+                            showSubtitleDrawer = false
+                            showAudioDrawer = true
                             showHUD = false
                         },
                         onToggleStats: { showStats.toggle() },
@@ -124,131 +150,204 @@ struct PlayerScreenView: View {
                         onStyleChange: { mutate in
                             Task { await env.updateSubtitleStyle(mutate) }
                         },
+                        onClearSubtitle: {
+                            subtitleTrack = nil
+                        },
                         onClose: {
                             showSubtitleDrawer = false
-                            showHUD = true
                         }
                     )
-                    .frame(width: 640)
+                    .padding(.vertical, 40)
+                    .padding(.trailing, 50)
                 }
-                .transition(.move(edge: .trailing))
+                .transition(.move(edge: .trailing).combined(with: .opacity))
+            }
+
+            if showAudioDrawer {
+                HStack {
+                    Spacer()
+                    AudioAndEngineDrawer(
+                        audioTracks: engine.audioTracks,
+                        embeddedSubtitleTracks: engine.embeddedSubtitleTracks,
+                        activeEngineKind: engine.activeEngineKind,
+                        currentPreference: enginePreference,
+                        onSelectAudio: { id in
+                            engine.selectAudioTrack(id: id)
+                        },
+                        onSelectEmbeddedSubtitle: { id in
+                            if id != nil {
+                                // Hide external overlay if user explicitly turns on PGS/embedded subtitle
+                                subtitleTrack = nil
+                            }
+                            engine.selectEmbeddedSubtitleTrack(id: id)
+                        },
+                        onSwitchEngine: { choice in
+                            Task { await switchEngine(to: choice) }
+                        },
+                        onClose: {
+                            showAudioDrawer = false
+                        }
+                    )
+                    .padding(.vertical, 40)
+                    .padding(.trailing, 50)
+                }
+                .transition(.move(edge: .trailing).combined(with: .opacity))
             }
 
             if let subtitleNotice {
                 VStack {
                     HStack {
                         Text(subtitleNotice)
-                            .font(.system(size: 20, weight: .medium))
+                            .font(.system(size: 18, weight: .semibold))
                             .padding(.horizontal, 20)
                             .padding(.vertical, 12)
                             .tvGlassSurface(cornerRadius: 14)
                         Spacer()
                     }
-                    .padding(50)
                     Spacer()
                 }
+                .padding(.top, 50)
+                .padding(.leading, 70)
+                .transition(.opacity)
             }
 
             if let loadError {
-                VStack(spacing: 16) {
-                    Text("播放失败")
-                        .font(.system(size: 32, weight: .bold))
+                VStack(spacing: 18) {
+                    Image(systemName: "exclamationmark.triangle.fill")
+                        .font(.system(size: 56))
+                        .foregroundStyle(.yellow)
+                    Text("无法播放该视频")
+                        .font(.system(size: 30, weight: .bold))
                     Text(loadError)
-                        .font(.system(size: 20))
+                        .font(.system(size: 18))
                         .foregroundStyle(TVTheme.secondaryText)
                         .multilineTextAlignment(.center)
                     Button("返回") { shutdown() }
+                        .buttonStyle(.borderedProminent)
                 }
-                .padding(40)
+                .padding(44)
                 .tvGlassSurface(cornerRadius: 24)
             }
         }
-        .task { await boot() }
-        .onDisappear { shutdown() }
+        .task { await startPlayback() }
         .onChange(of: engine.currentTime) { _, newValue in
             persistProgress(newValue)
+        }
+        .onDisappear {
+            shutdown()
         }
     }
 
     private var statsBar: some View {
-        let stats = engine.currentStats()
-        return HStack(spacing: 26) {
-            Text(stats.videoCodec.uppercased())
-            Text(stats.resolution)
-            Text(stats.dynamicRange)
-            Text(String(format: "%.2f fps", stats.frameRate))
-            Text("丢帧 \(stats.droppedFrames)")
-            Text(String(format: "读取 %.1f Mbps", stats.readMbps))
-            Text(String(format: "内存 %.0f MB", stats.memoryMB))
-            Spacer()
+        let s = engine.currentStats()
+        return HStack(spacing: 18) {
+            Text(s.engineName)
+                .foregroundStyle(TVTheme.accent)
+            Text(s.videoCodec)
+            Text(s.resolution)
+            Text(s.dynamicRange)
+            Text(String(format: "%.2f fps", s.frameRate))
+            Text(s.isHardwareDecoding ? "HW" : "SW")
+            Text(String(format: "%.1f Mbps", s.readMbps))
+            Text("掉帧 \(s.droppedFrames)")
+            Text(String(format: "%.0f MB", s.memoryMB))
         }
-        .font(.system(size: 18, weight: .medium, design: .monospaced))
-        .foregroundStyle(.white.opacity(0.8))
-        .padding(.horizontal, 22)
+        .font(.system(size: 16, weight: .medium, design: .monospaced))
+        .padding(.horizontal, 18)
         .padding(.vertical, 10)
         .tvGlassSurface(cornerRadius: 12)
         .padding(.top, 30)
     }
 
     private var scrubPill: some View {
-        VStack(spacing: 8) {
+        let sign = scrub.deltaSeconds >= 0 ? "+" : "-"
+        let arrow = scrub.deltaSeconds >= 0 ? ">>>" : "<<<"
+        return VStack(spacing: 8) {
             HStack(spacing: 14) {
-                Text(scrub.deltaSeconds >= 0 ? ">>>" : "<<<")
-                    .font(.system(size: 26, weight: .heavy, design: .monospaced))
-                Text(formatted(scrub.targetTime))
-                    .font(.system(size: 26, weight: .bold, design: .monospaced))
-                Text("/ \(formatted(engine.duration))")
-                    .font(.system(size: 18, design: .monospaced))
-                    .foregroundStyle(TVTheme.secondaryText)
+                Text(arrow).foregroundStyle(TVTheme.accent)
+                Text("\(sign)\(formatTime(abs(scrub.deltaSeconds)))")
+                    .foregroundStyle(TVTheme.accent)
+                Text("|").foregroundStyle(TVTheme.tertiaryText)
+                Text("\(formatTime(scrub.targetTime)) / \(formatTime(engine.duration))")
             }
-            ProgressView(value: engine.duration > 0 ? min(max(scrub.targetTime / engine.duration, 0), 1) : 0)
-                .tint(TVTheme.accent)
-                .frame(width: 520)
+            .font(.system(size: 24, weight: .bold, design: .monospaced))
+
+            GeometryReader { proxy in
+                let ratio = engine.duration > 0 ? min(max(scrub.targetTime / engine.duration, 0), 1) : 0
+                ZStack(alignment: .leading) {
+                    Capsule().fill(Color.white.opacity(0.18))
+                    Capsule()
+                        .fill(TVTheme.accent)
+                        .frame(width: max(0, proxy.size.width * ratio))
+                }
+            }
+            .frame(width: 420, height: 6)
         }
-        .padding(.horizontal, 30)
-        .padding(.vertical, 16)
-        .tvGlassSurface(cornerRadius: 22)
-        .padding(.bottom, 40)
+        .padding(.horizontal, 26)
+        .padding(.vertical, 14)
+        .tvGlassSurface(cornerRadius: 20)
+        .padding(.bottom, 16)
     }
 
-    private func formatted(_ seconds: TimeInterval) -> String {
-        guard seconds.isFinite, seconds >= 0 else { return "00:00" }
-        let total = Int(seconds)
-        let h = total / 3600
-        let m = (total % 3600) / 60
-        let s = total % 60
-        return h > 0
-            ? String(format: "%02d:%02d:%02d", h, m, s)
-            : String(format: "%02d:%02d", m, s)
+    private var fastPlayPill: some View {
+        HStack(spacing: 10) {
+            Text(fastPlayDirection == .forward ? ">>> 3.0x 倍速播放" : "<<< 快退")
+                .font(.system(size: 22, weight: .bold, design: .monospaced))
+                .foregroundStyle(TVTheme.accent)
+        }
+        .padding(.horizontal, 24)
+        .padding(.vertical, 12)
+        .tvGlassSurface(cornerRadius: 18)
+        .padding(.bottom, 16)
     }
 
-    private func boot() async {
+    private func startPlayback() async {
         do {
-            let newProvider = env.makeProvider(for: request.source)
-            guard let newProvider else {
-                loadError = "无法为该网络源创建连接器"
-                return
-            }
-            provider = newProvider
+            let newProvider = try env.makeProvider(for: request.source)
+            self.provider = newProvider
             try await newProvider.connect()
-
             let stream = try await newProvider.openStream(at: request.item.path)
             let cacheConfig = StreamCacheConfiguration(
                 maxCacheBytes: env.settings.readAheadCacheLimitMB * 1024 * 1024
             )
-            let registered = try env.proxy.register(
+            let registered = try env.streamProxy.register(
                 stream: stream,
                 fileName: request.item.name,
                 wrapWithReadAheadCache: true,
                 cacheConfig: cacheConfig
             )
-            try await engine.load(url: registered.url, startAt: request.resumeAt)
-            DisplayModeCoordinator.shared.apply(
-                refreshRate: Float(engine.currentStats().frameRate),
-                formatDescription: engine.videoFormatDescription
+            self.activeStreamURL = registered.url
+            try await engine.load(
+                url: registered.url,
+                fileName: request.item.name,
+                startAt: request.resumeAt,
+                preference: enginePreference
             )
+            if engine.activeEngineKind == .avPlayer {
+                DisplayModeCoordinator.shared.apply(
+                    refreshRate: Float(engine.currentStats().frameRate),
+                    formatDescription: engine.avAdapter.videoFormatDescription
+                )
+            }
             scheduleHUDHide()
             await loadSubtitles(provider: newProvider)
+        } catch {
+            loadError = error.localizedDescription
+        }
+    }
+
+    private func switchEngine(to choice: PreferredEngineChoice) async {
+        enginePreference = choice
+        guard let url = activeStreamURL else { return }
+        let currentPos = engine.currentTime
+        showAudioDrawer = false
+        do {
+            try await engine.load(
+                url: url,
+                fileName: request.item.name,
+                startAt: currentPos,
+                preference: choice
+            )
         } catch {
             loadError = error.localizedDescription
         }
@@ -313,10 +412,18 @@ struct PlayerScreenView: View {
     }
 
     private func beginLongHold(_ direction: ScrubDirection) {
-        engine.pause()
-        engine.setMuted(true)
         hudHideTask?.cancel()
         showHUD = false
+        if env.settings.longPressSeekMode == .continuousFastPlay && direction == .forward {
+            isFastPlaying = true
+            fastPlayDirection = direction
+            engine.setPlaybackRate(3.0)
+            engine.play()
+            return
+        }
+
+        engine.pause()
+        engine.setMuted(true)
         scrub.beginHold(
             direction: direction,
             currentPlaybackTime: engine.currentTime,
@@ -327,6 +434,11 @@ struct PlayerScreenView: View {
     }
 
     private func endLongHold() {
+        if isFastPlaying {
+            isFastPlaying = false
+            engine.setPlaybackRate(1.0)
+            return
+        }
         scrub.endHold { target in
             await engine.seek(to: target, precise: true)
             engine.setMuted(false)
@@ -338,7 +450,7 @@ struct PlayerScreenView: View {
         hudHideTask?.cancel()
         hudHideTask = Task { @MainActor in
             try? await Task.sleep(nanoseconds: 4_500_000_000)
-            guard !Task.isCancelled, scrub.isScrubbing == false, !showSubtitleDrawer else { return }
+            guard !Task.isCancelled, scrub.isScrubbing == false, !anyDrawerOpen else { return }
             showHUD = false
         }
     }
@@ -363,11 +475,22 @@ struct PlayerScreenView: View {
 
     private func shutdown() {
         hudHideTask?.cancel()
-        engine.pause()
+        engine.shutdown()
         DisplayModeCoordinator.shared.reset()
         if let provider {
             Task { await provider.disconnect() }
         }
         dismiss()
+    }
+
+    private func formatTime(_ seconds: TimeInterval) -> String {
+        guard seconds.isFinite, seconds >= 0 else { return "00:00" }
+        let total = Int(seconds)
+        let h = total / 3600
+        let m = (total % 3600) / 60
+        let s = total % 60
+        return h > 0
+            ? String(format: "%d:%02d:%02d", h, m, s)
+            : String(format: "%02d:%02d", m, s)
     }
 }

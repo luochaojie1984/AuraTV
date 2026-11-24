@@ -1,14 +1,38 @@
 import Foundation
 import CoreMedia
 
+public struct EngineTrackInfo: Identifiable, Hashable, Sendable {
+    public let id: Int32
+    public let name: String
+    public let languageCode: String?
+    public let isEnabled: Bool
+    public let isImageSubtitle: Bool
+
+    public init(
+        id: Int32,
+        name: String,
+        languageCode: String? = nil,
+        isEnabled: Bool = false,
+        isImageSubtitle: Bool = false
+    ) {
+        self.id = id
+        self.name = name
+        self.languageCode = languageCode
+        self.isEnabled = isEnabled
+        self.isImageSubtitle = isImageSubtitle
+    }
+}
+
 /// Uniform playback surface implemented by every engine core
-/// (AVPlayer/VideoToolbox today, KSPlayer or MPVKit later).
+/// (KSPlayer/FFmpeg+VideoToolbox and AVPlayer/VideoToolbox).
 @MainActor
 public protocol PlayerEngineProtocol: AnyObject {
     var currentTime: TimeInterval { get }
     var duration: TimeInterval { get }
     var isPlaying: Bool { get }
     var playbackRate: Float { get }
+    var audioTracks: [EngineTrackInfo] { get }
+    var embeddedSubtitleTracks: [EngineTrackInfo] { get }
 
     func load(url: URL, startAt time: TimeInterval) async throws
     func play()
@@ -18,10 +42,13 @@ public protocol PlayerEngineProtocol: AnyObject {
     func seekToKeyframePreview(at time: TimeInterval) async
     func setMuted(_ muted: Bool)
     func setPlaybackRate(_ rate: Float)
+    func selectAudioTrack(id: Int32)
+    func selectEmbeddedSubtitleTrack(id: Int32?)
     func currentStats() -> PlaybackStats
 }
 
 public struct PlaybackStats: Sendable, Equatable {
+    public var engineName: String
     public var videoCodec: String
     public var resolution: String
     public var dynamicRange: String
@@ -32,6 +59,7 @@ public struct PlaybackStats: Sendable, Equatable {
     public var isHardwareDecoding: Bool
 
     public init(
+        engineName: String = "AVPlayer",
         videoCodec: String = "unknown",
         resolution: String = "unknown",
         dynamicRange: String = "SDR",
@@ -41,6 +69,7 @@ public struct PlaybackStats: Sendable, Equatable {
         memoryMB: Double = 0,
         isHardwareDecoding: Bool = true
     ) {
+        self.engineName = engineName
         self.videoCodec = videoCodec
         self.resolution = resolution
         self.dynamicRange = dynamicRange

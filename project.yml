@@ -35,6 +35,7 @@ targets:
         embed: true
       - package: KSPlayer
         product: KSPlayer
+        embed: true
     info:
       path: Sources/TVApp/Info.plist
       properties:

@@ -2,11 +2,12 @@ import SwiftUI
 import AppPreferences
 
 struct PlayerHUDView: View {
-    @ObservedObject var engine: AVPlayerEngineAdapter
+    @ObservedObject var engine: PlaybackCoordinator
     let settings: AppSettings
     let onTogglePlay: () -> Void
     let onSeek: (TimeInterval) -> Void
     let onOpenSubtitles: () -> Void
+    let onOpenAudioAndEngine: () -> Void
     let onToggleStats: () -> Void
     let onExit: () -> Void
 
@@ -36,6 +37,11 @@ struct PlayerHUDView: View {
 
                 Button(action: onOpenSubtitles) {
                     Label("字幕样式", systemImage: "textformat.size")
+                }
+                .buttonStyle(.bordered)
+
+                Button(action: onOpenAudioAndEngine) {
+                    Label("音轨/引擎", systemImage: "hifispeaker.2")
                 }
                 .buttonStyle(.bordered)
 
