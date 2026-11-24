@@ -67,9 +67,15 @@ jobs:
     runs-on: xcode-27
     steps:
       - uses: actions/checkout@v4
-      - name: Install XcodeGen & Generate Project
+      - name: Install XcodeGen & Generate Simulator Project (exclude device-only KSPlayer)
         run: |
           brew install xcodegen
+          python3 -c '
+import re
+txt = open("project.yml").read()
+txt = re.sub(r"\s*- package: KSPlayer\s*\n\s*product: KSPlayer(?:UI)?\s*\n", "\n", txt)
+open("project.yml", "w").write(txt)
+'
           xcodegen generate
       - name: Build for tvOS 27 Simulator & Capture Screenshot
         run: |
