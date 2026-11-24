@@ -1,7 +1,7 @@
 import Foundation
 import SubtitleKit
 
-/// Persists user playback settings (MX seek mode, short seek step, cache cap, subtitle appearance).
+/// Persists user playback settings (MX seek mode, 5s-step short seek, transparent bar style, resume toggle, cache cap, subtitle appearance).
 public actor AppSettingsStore {
     private let fileURL: URL
     private var cached: AppSettings?
@@ -26,7 +26,10 @@ public actor AppSettingsStore {
     public func save(_ settings: AppSettings) throws {
         var sanitized = settings
         sanitized.readAheadCacheLimitMB = min(max(sanitized.readAheadCacheLimitMB, 64), 192)
-        sanitized.shortSeekSeconds = min(max(sanitized.shortSeekSeconds, 3), 60)
+        sanitized.shortSeekSeconds = min(max(sanitized.shortSeekSeconds, 5), 120)
+        sanitized.scrubBarOpacity = min(max(sanitized.scrubBarOpacity, 0.15), 1.0)
+        sanitized.scrubBarHeight = min(max(sanitized.scrubBarHeight, 3.0), 14.0)
+        sanitized.scrubTimeTextOpacity = min(max(sanitized.scrubTimeTextOpacity, 0.2), 1.0)
         cached = sanitized
 
         let dir = fileURL.deletingLastPathComponent()

@@ -37,21 +37,20 @@ struct PlayerScreenView: View {
 
     @State private var scrubEngine = LiveKeyframeScrubEngine()
     @State private var scrubPrepareTask: Task<Void, Never>?
-    @State private var provider: (any VFSProvider)?
     @State private var activeStreamToken: String?
     @State private var activeStreamURL: URL?
     @State private var enginePreference: PreferredEngineChoice = .auto
     @State private var subtitleTrack: ParsedSubtitleTrack?
-    @State private var subtitleNotice: String?
+    @State private var topNotice: String?
     @State private var showHUD = false
     @State private var showSubtitleDrawer = false
     @State private var showAudioDrawer = false
-    @State private var shortSeekNotice: String?
     @State private var showStats = false
     @State private var isFastPlaying = false
     @State private var fastPlayDirection: ScrubDirection = .forward
     @State private var loadError: String?
     @State private var hudHideTask: Task<Void, Never>?
+    @State private var noticeTask: Task<Void, Never>?
     @State private var lastReportedSecond: Int = -1
     @State private var didShutdown: Bool = false
 
@@ -75,16 +74,10 @@ struct PlayerScreenView: View {
                 .ignoresSafeArea()
             #endif
 
-            // Full-screen hardware-decoded live keyframe overlay during multi-stage shuttle / hold / touchpad scrub.
-            // Retained until the main player completes its resume seek -> zero black flash!
-            if let previewCG = scrub.previewImage {
-                Image(decorative: previewCG, scale: 1.0)
-                    .resizable()
-                    .aspectRatio(contentMode: .fit)
-                    .frame(maxWidth: .infinity, maxHeight: .infinity)
-                    .background(Color.black)
-                    .ignoresSafeArea()
-            }
+            // Direct CoreAnimation CALayer live-frame display (<0.1ms swap, ZERO SwiftUI view-tree diffing!)
+            ScrubFrameDisplayView(presenter: scrub.framePresenter)
+                .ignoresSafeArea()
+                .allowsHitTesting(false)
 
             SubtitleOverlayView(
                 track: subtitleTrack ?? ParsedSubtitleTrack(cues: [], format: "empty"),
@@ -147,24 +140,12 @@ struct PlayerScreenView: View {
             .ignoresSafeArea()
             .allowsHitTesting(!showHUD && !anyDrawerOpen && loadError == nil)
 
+            // Top stats & HUD overlay
             VStack {
                 if showStats {
                     statsBar
                 }
                 Spacer()
-                if scrub.isScrubbing {
-                    scrubPill
-                } else if isFastPlaying {
-                    fastPlayPill
-                } else if let shortSeekNotice {
-                    Text(shortSeekNotice)
-                        .font(.system(size: 24, weight: .bold, design: .monospaced))
-                        .foregroundStyle(TVTheme.accent)
-                        .padding(.horizontal, 24)
-                        .padding(.vertical, 12)
-                        .tvGlassSurface(cornerRadius: 18)
-                        .padding(.bottom, 16)
-                }
                 if showHUD {
                     PlayerHUDView(
                         engine: engine,
@@ -186,11 +167,22 @@ struct PlayerScreenView: View {
                         onToggleStats: { showStats.toggle() },
                         onExit: { shutdown() }
                     )
+                    .padding(.horizontal, 60)
+                    .padding(.bottom, 44)
                     .transition(.move(edge: .bottom).combined(with: .opacity))
                 }
             }
-            .padding(.horizontal, 60)
-            .padding(.bottom, 44)
+
+            // Ultra-thin MX Player-style translucent progress bar pinned flush to the bottom edge
+            if !showHUD && (scrub.isShowingBar || isFastPlaying) {
+                VStack {
+                    Spacer()
+                    mxBottomScrubBar
+                }
+                .padding(.horizontal, 44)
+                .padding(.bottom, 16)
+                .allowsHitTesting(false)
+            }
 
             if showSubtitleDrawer {
                 HStack {
@@ -225,7 +217,6 @@ struct PlayerScreenView: View {
                         },
                         onSelectEmbeddedSubtitle: { id in
                             if id != nil {
-                                // Hide external overlay if user explicitly turns on PGS/embedded subtitle
                                 subtitleTrack = nil
                             }
                             engine.selectEmbeddedSubtitleTrack(id: id)
@@ -243,20 +234,22 @@ struct PlayerScreenView: View {
                 .transition(.move(edge: .trailing).combined(with: .opacity))
             }
 
-            if let subtitleNotice {
+            if let topNotice {
                 VStack {
                     HStack {
-                        Text(subtitleNotice)
-                            .font(.system(size: 18, weight: .semibold))
-                            .padding(.horizontal, 20)
-                            .padding(.vertical, 12)
-                            .tvGlassSurface(cornerRadius: 14)
+                        Text(topNotice)
+                            .font(.system(size: 18, weight: .medium))
+                            .foregroundStyle(.white.opacity(0.88))
+                            .padding(.horizontal, 18)
+                            .padding(.vertical, 10)
+                            .background(Color.black.opacity(0.45), in: Capsule())
                         Spacer()
                     }
                     Spacer()
                 }
-                .padding(.top, 50)
-                .padding(.leading, 70)
+                .padding(.top, 42)
+                .padding(.leading, 56)
+                .allowsHitTesting(false)
                 .transition(.opacity)
             }
 
@@ -322,89 +315,71 @@ struct PlayerScreenView: View {
         .padding(.top, 30)
     }
 
-    private var scrubPill: some View {
-        let isForward: Bool = {
-            switch scrub.activeMode {
-            case .shuttle(let g): return g >= 0
-            case .hold(let dir, _): return dir == .forward
-            case .touchpad, .idle: return scrub.deltaSeconds >= 0
+    /// Ultra-thin MX Player-style transparent progress bar at the very bottom edge (minimal video obstruction).
+    private var mxBottomScrubBar: some View {
+        let barColor = Color(hex: env.settings.scrubBarColorHex)
+        let barOpacity = env.settings.scrubBarOpacity
+        let barHeight = CGFloat(env.settings.scrubBarHeight)
+        let timeOpacity = env.settings.scrubTimeTextOpacity
+        let displayTime = isFastPlaying ? engine.currentTime : scrub.targetTime
+        let ratio = engine.duration > 0 ? min(max(displayTime / engine.duration, 0), 1) : 0
+
+        let leftLabel: String = {
+            if isFastPlaying {
+                return fastPlayDirection == .forward ? ">>> 3.0x" : "<<<"
             }
+            let sign = scrub.deltaSeconds >= 0 ? "+" : "-"
+            let delta = formatTime(abs(scrub.deltaSeconds))
+            let badge = scrub.speedLabel
+            return badge.isEmpty ? "\(sign)\(delta)" : "\(badge)  \(sign)\(delta)"
         }()
-        let sign = scrub.deltaSeconds >= 0 ? "+" : "-"
-        let arrow = isForward ? ">>>" : "<<<"
 
-        return VStack(spacing: 10) {
-            HStack(spacing: 16) {
-                Text(arrow)
-                    .foregroundStyle(TVTheme.accent)
-
-                if !scrub.speedBadgeText.isEmpty {
-                    Text(scrub.speedBadgeText)
-                        .font(.system(size: 20, weight: .heavy, design: .monospaced))
-                        .foregroundStyle(.black)
-                        .padding(.horizontal, 12)
-                        .padding(.vertical, 4)
-                        .background(TVTheme.accent, in: Capsule())
+        return VStack(spacing: 6) {
+            if env.settings.showScrubTimeText {
+                HStack {
+                    Text(leftLabel)
+                    Spacer()
+                    Text("\(formatTime(displayTime)) / \(formatTime(engine.duration))")
                 }
-
-                Text("\(sign)\(formatTime(abs(scrub.deltaSeconds)))")
-                    .foregroundStyle(TVTheme.accent)
-
-                Text("|")
-                    .foregroundStyle(TVTheme.tertiaryText)
-
-                Text("\(formatTime(scrub.targetTime)) / \(formatTime(engine.duration))")
+                .font(.system(size: 18, weight: .medium, design: .monospaced))
+                .foregroundStyle(Color.white.opacity(timeOpacity))
+                .shadow(color: .black.opacity(0.65), radius: 2, x: 0, y: 1)
+                .padding(.horizontal, 4)
             }
-            .font(.system(size: 24, weight: .bold, design: .monospaced))
 
             GeometryReader { proxy in
-                let ratio = engine.duration > 0 ? min(max(scrub.targetTime / engine.duration, 0), 1) : 0
                 let fillWidth = max(0, proxy.size.width * ratio)
                 ZStack(alignment: .leading) {
-                    Capsule().fill(Color.white.opacity(0.20))
                     Capsule()
-                        .fill(TVTheme.accent)
+                        .fill(Color.white.opacity(0.22 * barOpacity))
+                    Capsule()
+                        .fill(barColor.opacity(barOpacity))
                         .frame(width: fillWidth)
-                    Circle()
-                        .fill(Color.white)
-                        .frame(width: 14, height: 14)
-                        .offset(x: max(0, min(proxy.size.width - 14, fillWidth - 7)))
+                    RoundedRectangle(cornerRadius: 1.5, style: .continuous)
+                        .fill(barColor.opacity(min(1.0, barOpacity + 0.28)))
+                        .frame(width: 3, height: barHeight + 4)
+                        .offset(x: max(0, min(proxy.size.width - 3, fillWidth - 1.5)))
                 }
             }
-            .frame(width: 540, height: 8)
-
-            if !scrub.hintText.isEmpty {
-                Text(scrub.hintText)
-                    .font(.system(size: 16, weight: .medium))
-                    .foregroundStyle(TVTheme.secondaryText)
-            }
+            .frame(height: barHeight)
         }
-        .padding(.horizontal, 30)
-        .padding(.vertical, 16)
-        .tvGlassSurface(cornerRadius: 22)
-        .padding(.bottom, 16)
-    }
-
-    private var fastPlayPill: some View {
-        HStack(spacing: 10) {
-            Text(fastPlayDirection == .forward ? ">>> 3.0x 倍速播放" : "<<< 快退")
-                .font(.system(size: 22, weight: .bold, design: .monospaced))
-                .foregroundStyle(TVTheme.accent)
-        }
-        .padding(.horizontal, 24)
-        .padding(.vertical, 12)
-        .tvGlassSurface(cornerRadius: 18)
-        .padding(.bottom, 16)
     }
 
     private func startPlayback() async {
         do {
-            guard let newProvider = env.makeProvider(for: request.source) else {
-                throw VFSError.invalidURL(request.source.host)
+            let activeProvider: any VFSProvider
+            let stream: any VFSRandomAccessStream
+            do {
+                let p = try await env.connectedProvider(for: request.source)
+                stream = try await p.openStream(at: request.item.path)
+                activeProvider = p
+            } catch {
+                // Transparently reconnect once if cached SMB/WebDAV session idled out
+                let p = try await env.connectedProvider(for: request.source, forceReconnect: true)
+                stream = try await p.openStream(at: request.item.path)
+                activeProvider = p
             }
-            self.provider = newProvider
-            try await newProvider.connect()
-            let stream = try await newProvider.openStream(at: request.item.path)
+
             let cacheConfig = StreamCacheConfiguration(
                 maxCacheBytes: env.settings.readAheadCacheLimitMB * 1024 * 1024
             )
@@ -416,10 +391,12 @@ struct PlayerScreenView: View {
             )
             self.activeStreamToken = registered.token
             self.activeStreamURL = registered.url
+
+            let effectiveStartAt = env.settings.enableResumePlayback ? request.resumeAt : 0
             try await engine.load(
                 url: registered.url,
                 fileName: request.item.name,
-                startAt: request.resumeAt,
+                startAt: effectiveStartAt,
                 preference: enginePreference
             )
             if engine.activeEngineKind == .avPlayer {
@@ -428,7 +405,12 @@ struct PlayerScreenView: View {
                     formatDescription: engine.avAdapter.videoFormatDescription
                 )
             }
-            // Warm up dedicated hardware keyframe scrub engine in background (hits pinned RAM headers in <15ms)
+
+            if effectiveStartAt >= 5 {
+                showTopNotice("已从 \(formatTime(effectiveStartAt)) 继续播放")
+            }
+
+            // Warm up dedicated hardware keyframe scrub engine silently in background
             let localScrub = scrubEngine
             let streamURL = registered.url
             scrubPrepareTask?.cancel()
@@ -436,7 +418,7 @@ struct PlayerScreenView: View {
                 await localScrub.prepare(url: streamURL)
             }
             scheduleHUDHide()
-            await loadSubtitles(provider: newProvider)
+            await loadSubtitles(provider: activeProvider)
         } catch {
             loadError = error.localizedDescription
         }
@@ -489,13 +471,19 @@ struct PlayerScreenView: View {
             let data = try await provider.readFileData(at: best.path, maxBytes: 8 * 1024 * 1024)
             let parsed = SubtitleParser.parse(data: data, fileExtension: best.formatExtension)
             subtitleTrack = parsed.track
-            subtitleNotice = "已自动加载外挂字幕：\(best.name)"
-            Task {
-                try? await Task.sleep(nanoseconds: 2_500_000_000)
-                subtitleNotice = nil
-            }
+            showTopNotice("已自动加载外挂字幕：\(best.name)")
         } catch {
             // Subtitles are optional; playback must never fail because of them.
+        }
+    }
+
+    private func showTopNotice(_ message: String) {
+        noticeTask?.cancel()
+        topNotice = message
+        noticeTask = Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 2_300_000_000)
+            guard !Task.isCancelled else { return }
+            topNotice = nil
         }
     }
 
@@ -509,26 +497,28 @@ struct PlayerScreenView: View {
         scheduleHUDHide()
     }
 
-    // MARK: - 3-in-1 MX Live Scrub Controls
+    // MARK: - MX Live Scrub Controls
 
     private func makePreviewFrameLoader() -> MXScrubController.PreviewFrameLoader {
         let localScrubEngine = scrubEngine
         let localEngine = engine
         return { target in
-            if let frame = await localScrubEngine.decodePreviewFrame(at: target) {
-                return frame
+            let outcome = await localScrubEngine.decodePreviewFrame(at: target)
+            switch outcome {
+            case .frame, .unchanged:
+                return outcome
+            case .unavailable:
+                await localEngine.seekToKeyframePreview(at: target)
+                return .unavailable
             }
-            // Fallback when LiveKeyframeScrubEngine is still initializing or codec unsupported
-            await localEngine.seekToKeyframePreview(at: target)
-            return nil
         }
     }
 
     private func enterScrubHardwareStateIfNeeded() {
         hudHideTask?.cancel()
         showHUD = false
-        shortSeekNotice = nil
         guard !scrub.isScrubbing else { return }
+        scrubEngine.resetTracking()
         if let token = activeStreamToken {
             env.proxy.setScrubMode(true, for: token)
         }
@@ -561,25 +551,23 @@ struct PlayerScreenView: View {
                 commitActiveScrub()
             }
         } else {
-            if scrub.isScrubbing {
-                commitActiveScrub()
-            } else {
-                Task { await shortSeek(direction) }
+            // Default: fixed 5s-increment step jump with rapid multi-tap coalescing & live frame preview
+            enterScrubHardwareStateIfNeeded()
+            let token = activeStreamToken
+            scrub.triggerShortStep(
+                direction: direction,
+                stepSeconds: env.settings.shortSeekSeconds,
+                currentPlaybackTime: engine.currentTime,
+                duration: engine.duration,
+                onPreviewFrame: makePreviewFrameLoader()
+            ) { finalTarget in
+                if let token {
+                    env.proxy.setScrubMode(false, for: token)
+                }
+                await engine.seek(to: finalTarget, precise: true)
+                engine.setMuted(false)
+                engine.play()
             }
-        }
-    }
-
-    private func shortSeek(_ direction: ScrubDirection) async {
-        let stepSeconds = Int(env.settings.shortSeekSeconds)
-        let step = env.settings.shortSeekSeconds * Double(direction.rawValue)
-        let target = min(max(0, engine.currentTime + step), max(0, engine.duration))
-        shortSeekNotice = direction == .forward
-            ? ">>> +\(stepSeconds)s  |  \(formatTime(target))"
-            : "<<< -\(stepSeconds)s  |  \(formatTime(target))"
-        await engine.seek(to: target, precise: true)
-        Task { @MainActor in
-            try? await Task.sleep(nanoseconds: 1_000_000_000)
-            shortSeekNotice = nil
         }
     }
 
@@ -597,6 +585,7 @@ struct PlayerScreenView: View {
         enterScrubHardwareStateIfNeeded()
         scrub.beginHold(
             direction: direction,
+            speedProfile: env.settings.longPressSpeedProfile,
             currentPlaybackTime: engine.currentTime,
             duration: engine.duration,
             onPreviewFrame: makePreviewFrameLoader()
@@ -639,6 +628,7 @@ struct PlayerScreenView: View {
     }
 
     private func persistProgress(_ time: TimeInterval) {
+        guard env.settings.enableResumePlayback else { return }
         let second = Int(time)
         guard second != lastReportedSecond else { return }
         lastReportedSecond = second
@@ -660,6 +650,7 @@ struct PlayerScreenView: View {
         guard !didShutdown else { return }
         didShutdown = true
         hudHideTask?.cancel()
+        noticeTask?.cancel()
         scrubPrepareTask?.cancel()
         scrub.cancelAll()
         if let token = activeStreamToken {
@@ -671,9 +662,7 @@ struct PlayerScreenView: View {
         Task { await localScrub.close() }
         engine.shutdown()
         DisplayModeCoordinator.shared.reset()
-        if let provider {
-            Task { await provider.disconnect() }
-        }
+        // NOTE: Keep shared LAN provider warm in AppEnvironment so returning to folder & next video needs zero reconnect!
         dismiss()
     }
 

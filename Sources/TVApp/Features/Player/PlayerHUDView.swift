@@ -16,6 +16,8 @@ struct PlayerHUDView: View {
         return min(max(engine.currentTime / engine.duration, 0), 1)
     }
 
+    private var stepInt: Int { max(5, Int(settings.shortSeekSeconds)) }
+
     var body: some View {
         VStack(spacing: 14) {
             HStack(alignment: .center, spacing: 18) {
@@ -60,7 +62,9 @@ struct PlayerHUDView: View {
                 Button {
                     onSeek(max(0, engine.currentTime - settings.shortSeekSeconds))
                 } label: {
-                    Image(systemName: "gobackward.10")
+                    Text("-\(stepInt)s")
+                        .font(.system(size: 17, weight: .bold, design: .monospaced))
+                        .foregroundStyle(TVTheme.secondaryText)
                 }
                 .buttonStyle(.plain)
                 .disabled(engine.duration <= 0)
@@ -69,7 +73,7 @@ struct PlayerHUDView: View {
                     ZStack(alignment: .leading) {
                         Capsule().fill(Color.white.opacity(0.18))
                         Capsule()
-                            .fill(TVTheme.accent)
+                            .fill(Color(hex: settings.scrubBarColorHex))
                             .frame(width: max(0, proxy.size.width * progress))
                     }
                 }
@@ -78,7 +82,9 @@ struct PlayerHUDView: View {
                 Button {
                     onSeek(min(engine.duration, engine.currentTime + settings.shortSeekSeconds))
                 } label: {
-                    Image(systemName: "goforward.10")
+                    Text("+\(stepInt)s")
+                        .font(.system(size: 17, weight: .bold, design: .monospaced))
+                        .foregroundStyle(TVTheme.secondaryText)
                 }
                 .buttonStyle(.plain)
                 .disabled(engine.duration <= 0)

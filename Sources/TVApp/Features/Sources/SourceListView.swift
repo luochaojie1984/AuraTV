@@ -35,7 +35,7 @@ struct SourceListView: View {
                         Button {
                             browserTarget = BrowserTarget(source: source)
                         } label: {
-                            SourceCard(source: source)
+                            SourceCard(source: source, isConnected: env.connectedSourceIDs.contains(source.id))
                         }
                         .buttonStyle(.plain)
 
@@ -62,10 +62,7 @@ struct SourceListView: View {
             SourceEditorView(existing: source)
         }
         .fullScreenCover(item: $browserTarget) { target in
-            FileBrowserView(target: target) { request in
-                browserTarget = nil
-                _ = request
-            }
+            FileBrowserView(target: target)
         }
         .sheet(item: $speedTestSource) { source in
             SpeedTestView(source: source)

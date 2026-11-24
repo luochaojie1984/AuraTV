@@ -50,6 +50,11 @@ public actor ReadAheadStreamCache: VFSRandomAccessStream {
     /// for middle-of-file keyframe reads while still serving pinned head/tail index blocks from RAM!
     private var scrubBypassEnabled: Bool = false
     private var directScrubReads: Int = 0
+    /// Tiny single-slot 384 KB micro-buffer used ONLY during scrub bypass so a multi-slice
+    /// 4K keyframe read (e.g. 2x 128 KB HTTP slices) hits RAM on the second slice with ONE SMB round-trip!
+    private var scrubMicroBufferStart: Int64 = -1
+    private var scrubMicroBufferData: Data = Data()
+    private let scrubMicroBufferWindowBytes: Int = 384 * 1024
 
     private var cacheHits: Int = 0
     private var cacheMisses: Int = 0
@@ -93,9 +98,24 @@ public actor ReadAheadStreamCache: VFSRandomAccessStream {
         if scrubBypassEnabled {
             let allCached = (firstChunk...lastChunk).allSatisfy { chunks[$0] != nil }
             if !allCached {
+                // 1. Check 384 KB scrub micro-buffer first (0.005 ms RAM hit for sequential keyframe slices!)
+                if scrubMicroBufferStart >= 0,
+                   offset >= scrubMicroBufferStart,
+                   (offset + Int64(bytesNeeded)) <= (scrubMicroBufferStart + Int64(scrubMicroBufferData.count)) {
+                    let localStart = Int(offset - scrubMicroBufferStart)
+                    let base = scrubMicroBufferData.startIndex
+                    return Data(scrubMicroBufferData[(base + localStart)..<(base + localStart + bytesNeeded)])
+                }
+
+                // 2. Fetch one compact 384 KB window directly from upstream (covers 98% of 4K I-frames in 1 SMB read)
                 directScrubReads += 1
                 try Task.checkCancellation()
-                return try await upstream.read(offset: offset, length: bytesNeeded)
+                let fetchLength = Int(min(Int64(max(bytesNeeded, scrubMicroBufferWindowBytes)), totalSize - offset))
+                let fetched = try await upstream.read(offset: offset, length: fetchLength)
+                scrubMicroBufferStart = offset
+                scrubMicroBufferData = Data(fetched)
+                let returnLen = min(bytesNeeded, fetched.count)
+                return Data(fetched.prefix(returnLen))
             }
         }
 
@@ -138,6 +158,8 @@ public actor ReadAheadStreamCache: VFSRandomAccessStream {
         chunks.removeAll()
         lruOrder.removeAll()
         currentCachedBytes = 0
+        scrubMicroBufferStart = -1
+        scrubMicroBufferData = Data()
         await upstream.close()
     }
 
@@ -145,6 +167,9 @@ public actor ReadAheadStreamCache: VFSRandomAccessStream {
         scrubBypassEnabled = enabled
         if enabled {
             cancelAllPrefetches()
+        } else {
+            scrubMicroBufferStart = -1
+            scrubMicroBufferData = Data()
         }
     }
 

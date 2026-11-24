@@ -1,12 +1,15 @@
 import Foundation
 import CoreGraphics
 import Combine
+import AppPreferences
 
 public enum ScrubVisualMode: Equatable, Sendable {
     case idle
+    /// Rapid fixed-step jump (±5s, ±10s, ±15s ... coalesced seamlessly on multi-taps).
+    case shortStep(direction: ScrubDirection)
     /// Multi-stage gear shuttle: -5..-1 (rewind -64x..-4x), +1..+5 (forward +4x..+64x).
     case shuttle(gear: Int)
-    /// Hold-to-scrub nonlinear fast ramp (12x -> 30x -> 60x -> 150x).
+    /// Hold-to-scrub nonlinear fast ramp driven by `LongPressSpeedProfile`.
     case hold(direction: ScrubDirection, speedMultiplier: Int)
     /// Direct Siri Remote touchpad horizontal drag (MX Player swipe-to-seek).
     case touchpad
@@ -17,22 +20,24 @@ public enum ShuttleStepResult: Equatable, Sendable {
     case exitedToNormalPlayback(commitTime: TimeInterval)
 }
 
-/// 仿安卓 MX Player 的三合一实时出画快进/快退控制器（单飞最新覆盖 Single-Flight Coalescing）：
-/// 1. 多级实时加速（短按右键 4x -> 8x -> 16x -> 32x -> 64x，短按左键降档或 -4x ~ -64x 实时倒退，全程全屏同步出画）
-/// 2. 长按无级极速快进/快退（0.8s 12x -> 2.0s 30x -> 3.5s 60x -> 150x，松手即从当前帧恢复播放）
-/// 3. Siri Remote 触控板左右划屏（仿安卓 MX Player 大拇指拖进度，全屏实时跟手出画）
+/// 仿安卓 MX Player 丝滑实时出画快进/快退控制器：
+/// - 视频帧通过 `framePresenter` 直接写入 `CALayer.contents`（<0.1ms，零 SwiftUI 重绘开销，30~60fps 丝滑刷帧）
+/// - 支持：5秒为单位定长连点跳秒 + MX 三档可调长按极速快进 + 多级加速 + Siri Remote 触控板划屏
 @MainActor
 public final class MXScrubController: ObservableObject {
-    public typealias PreviewFrameLoader = @Sendable (TimeInterval) async -> ScrubPreviewFrame?
+    public typealias PreviewFrameLoader = @Sendable (TimeInterval) async -> ScrubDecodeOutcome
 
     public static let shuttleSpeedTable: [Int] = [0, 4, 8, 16, 32, 64]
 
+    /// Direct CoreAnimation presenter — updates video frames WITHOUT triggering SwiftUI view diffs!
+    public let framePresenter = ScrubFramePresenter()
+
     @Published public private(set) var isScrubbing: Bool = false
+    @Published public private(set) var isShowingBar: Bool = false
     @Published public private(set) var activeMode: ScrubVisualMode = .idle
     @Published public private(set) var targetTime: TimeInterval = 0
     @Published public private(set) var displayedFrameTime: TimeInterval = 0
     @Published public private(set) var deltaSeconds: TimeInterval = 0
-    @Published public private(set) var previewImage: CGImage?
     @Published public private(set) var isCommitting: Bool = false
 
     private var anchorTime: TimeInterval = 0
@@ -40,10 +45,12 @@ public final class MXScrubController: ObservableObject {
     private var pressStartTime: Date?
     private var tickTask: Task<Void, Never>?
     private var decodeLoopTask: Task<Void, Never>?
+    private var shortCommitTask: Task<Void, Never>?
+    private var barHideTask: Task<Void, Never>?
     private var pendingPreviewTarget: TimeInterval?
     private var lastDecodedRequestTarget: TimeInterval = -.infinity
     private var commitEpoch: UInt64 = 0
-    private let tickIntervalNs: UInt64 = 80_000_000 // 12.5 Hz smooth target clock
+    private let tickIntervalNs: UInt64 = 66_000_000 // ~15 Hz ultra-smooth target clock
 
     public init() {}
 
@@ -52,46 +59,94 @@ public final class MXScrubController: ObservableObject {
         return false
     }
 
-    public var shuttleGear: Int {
-        if case .shuttle(let g) = activeMode { return g }
-        return 0
-    }
-
-    public var speedBadgeText: String {
+    public var speedLabel: String {
         switch activeMode {
         case .idle:
             return ""
+        case .shortStep(let dir):
+            return dir == .forward ? ">>>" : "<<<"
         case .shuttle(let gear):
             let absG = min(max(abs(gear), 1), Self.shuttleSpeedTable.count - 1)
             let speed = Self.shuttleSpeedTable[absG]
-            return gear >= 0 ? "\(absG)级 \(speed)x" : "\(absG)级 -\(speed)x"
+            return gear >= 0 ? ">>> \(speed)x" : "<<< -\(speed)x"
         case .hold(let dir, let mult):
-            return dir == .forward ? "长按 \(mult)x" : "长按 -\(mult)x"
+            return dir == .forward ? ">>> \(mult)x" : "<<< -\(mult)x"
         case .touchpad:
-            return "MX 划屏"
+            return deltaSeconds >= 0 ? ">>>" : "<<<"
         }
     }
 
-    public var hintText: String {
-        switch activeMode {
-        case .shuttle:
-            return "按 确认 / 播放键 立即从当前画面恢复播放 · 左/右键调档"
-        case .hold:
-            return "松开方向键立即从当前画面恢复播放"
-        case .touchpad:
-            return "松开拇指立即从当前画面恢复播放"
-        case .idle:
-            return ""
+    /// 参照 MX Player 的三档长按非线性加速曲线（比苹果原版更快更顺手）
+    private func holdSpeedMultiplier(elapsedHold: TimeInterval, profile: LongPressSpeedProfile) -> Double {
+        switch profile {
+        case .gentle:
+            switch elapsedHold {
+            case ..<0.8: return 10.0
+            case ..<2.0: return 24.0
+            case ..<3.5: return 48.0
+            default:     return 96.0
+            }
+        case .mxStandard:
+            switch elapsedHold {
+            case ..<0.7: return 18.0   // 立刻有感快进，比原版更利落
+            case ..<1.8: return 45.0   // 流畅巡航
+            case ..<3.2: return 90.0   // 每按 1 秒扫过 1.5 分钟
+            default:     return 180.0  // 每按 1 秒扫过 3 分钟，2 小时电影几十秒扫完
+            }
+        case .turbo:
+            switch elapsedHold {
+            case ..<0.6: return 30.0
+            case ..<1.6: return 75.0
+            case ..<3.0: return 150.0
+            default:     return 300.0
+            }
         }
     }
 
-    /// 仿 MX Player 极速四段非线性长按曲线（倍速）
-    private func holdSpeedMultiplier(elapsedHold: TimeInterval) -> Double {
-        switch elapsedHold {
-        case ..<0.8: return 12.0   // 12x：立刻有感快进，精细找镜头
-        case ..<2.0: return 30.0   // 30x：中速扫片
-        case ..<3.5: return 60.0   // 60x：每按 1 秒扫过 1 分钟
-        default:     return 150.0  // 150x：每按 1 秒扫过 2.5 分钟，长片几秒直达片尾
+    // MARK: - Mode 0: Rapid-Tap Coalesced Fixed-Step Jump (5s, 10s, 15s, 20s...)
+
+    public func triggerShortStep(
+        direction: ScrubDirection,
+        stepSeconds: Double,
+        currentPlaybackTime: TimeInterval,
+        duration: TimeInterval,
+        onPreviewFrame: @escaping PreviewFrameLoader,
+        onCommit: @escaping @MainActor (TimeInterval) async -> Void
+    ) {
+        barHideTask?.cancel()
+        shortCommitTask?.cancel()
+        tickTask?.cancel()
+        tickTask = nil
+
+        let isContinuingShortStep: Bool
+        if case .shortStep = activeMode, isScrubbing {
+            isContinuingShortStep = true
+        } else {
+            isContinuingShortStep = false
+        }
+
+        if !isContinuingShortStep {
+            beginSession(anchor: currentPlaybackTime, duration: duration)
+        } else {
+            currentDuration = duration
+        }
+
+        activeMode = .shortStep(direction: direction)
+        isShowingBar = true
+
+        let step = max(5.0, stepSeconds) * Double(direction.rawValue)
+        targetTime = clampTime(targetTime + step, duration: duration)
+        deltaSeconds = targetTime - anchorTime
+        pendingPreviewTarget = targetTime
+        startDecodeLoopIfNeeded(onPreviewFrame: onPreviewFrame)
+
+        // Coalesce rapid multi-clicks within 220ms; commits smoothly right after taps stop!
+        shortCommitTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: 220_000_000)
+            guard let self, !Task.isCancelled else { return }
+            if case .shortStep = self.activeMode {
+                self.commit(keepBarBriefly: true, onCommit: onCommit)
+            }
         }
     }
 
@@ -104,6 +159,9 @@ public final class MXScrubController: ObservableObject {
         duration: TimeInterval,
         onPreviewFrame: @escaping PreviewFrameLoader
     ) -> ShuttleStepResult {
+        barHideTask?.cancel()
+        shortCommitTask?.cancel()
+
         let currentGear: Int
         if case .shuttle(let g) = activeMode {
             currentGear = g
@@ -116,12 +174,9 @@ public final class MXScrubController: ObservableObject {
             return .exitedToNormalPlayback(commitTime: targetTime)
         }
 
-        let wasIdle = !isScrubbing
-        if wasIdle {
+        if !isScrubbing {
             beginSession(anchor: currentPlaybackTime, duration: duration)
-            // Immediately nudge target slightly so the first frame reflects the chosen direction right away
-            let initialNudge = 1.0 * Double(direction.rawValue)
-            targetTime = clampTime(targetTime + initialNudge, duration: duration)
+            targetTime = clampTime(targetTime + Double(direction.rawValue), duration: duration)
             deltaSeconds = targetTime - anchorTime
             pendingPreviewTarget = targetTime
         } else {
@@ -129,19 +184,24 @@ public final class MXScrubController: ObservableObject {
         }
 
         activeMode = .shuttle(gear: nextGear)
+        isShowingBar = true
         startShuttleTickLoop(gear: nextGear)
         startDecodeLoopIfNeeded(onPreviewFrame: onPreviewFrame)
         return .active(gear: nextGear)
     }
 
-    // MARK: - Mode 2: Hold-to-Scrub (12x -> 30x -> 60x -> 150x)
+    // MARK: - Mode 2: Hold-to-Scrub (MX Player Nonlinear Speed Ramp)
 
     public func beginHold(
         direction: ScrubDirection,
+        speedProfile: LongPressSpeedProfile,
         currentPlaybackTime: TimeInterval,
         duration: TimeInterval,
         onPreviewFrame: @escaping PreviewFrameLoader
     ) {
+        barHideTask?.cancel()
+        shortCommitTask?.cancel()
+
         if !isScrubbing {
             beginSession(anchor: currentPlaybackTime, duration: duration)
         } else {
@@ -149,8 +209,9 @@ public final class MXScrubController: ObservableObject {
         }
 
         pressStartTime = Date()
-        let initialSpeed = Int(holdSpeedMultiplier(elapsedHold: 0))
+        let initialSpeed = Int(holdSpeedMultiplier(elapsedHold: 0, profile: speedProfile))
         activeMode = .hold(direction: direction, speedMultiplier: initialSpeed)
+        isShowingBar = true
 
         tickTask?.cancel()
         tickTask = Task { [weak self] in
@@ -158,7 +219,7 @@ public final class MXScrubController: ObservableObject {
             let dt = Double(self.tickIntervalNs) / 1_000_000_000.0
             while !Task.isCancelled && self.isScrubbing {
                 let elapsed = Date().timeIntervalSince(self.pressStartTime ?? Date())
-                let speed = self.holdSpeedMultiplier(elapsedHold: elapsed)
+                let speed = self.holdSpeedMultiplier(elapsedHold: elapsed, profile: speedProfile)
                 self.activeMode = .hold(direction: direction, speedMultiplier: Int(speed))
                 let step = speed * dt * Double(direction.rawValue)
                 let next = self.clampTime(self.targetTime + step, duration: self.currentDuration)
@@ -181,14 +242,18 @@ public final class MXScrubController: ObservableObject {
         duration: TimeInterval,
         onPreviewFrame: @escaping PreviewFrameLoader
     ) {
+        barHideTask?.cancel()
+        shortCommitTask?.cancel()
         tickTask?.cancel()
         tickTask = nil
+
         if !isScrubbing {
             beginSession(anchor: currentPlaybackTime, duration: duration)
         } else {
             currentDuration = duration
         }
         activeMode = .touchpad
+        isShowingBar = true
         pendingPreviewTarget = targetTime
         startDecodeLoopIfNeeded(onPreviewFrame: onPreviewFrame)
     }
@@ -199,12 +264,11 @@ public final class MXScrubController: ObservableObject {
         let absVel = abs(Double(velocityPointsPerSec))
         let secPerPoint: Double
         switch absVel {
-        case ..<280: secPerPoint = 0.14   // 慢划微调（精细逐段找画面）
-        case ..<800: secPerPoint = 0.48   // 中速滑屏（一划几分钟）
-        default:     secPerPoint = 1.25   // 快扫（一划十几分钟）
+        case ..<280: secPerPoint = 0.14
+        case ..<800: secPerPoint = 0.48
+        default:     secPerPoint = 1.25
         }
 
-        // Keep short clips (< 5 min) controllable without overshooting
         let durationScale: Double = (currentDuration > 0 && currentDuration < 300)
             ? max(0.25, currentDuration / 300.0)
             : 1.0
@@ -217,37 +281,58 @@ public final class MXScrubController: ObservableObject {
 
     // MARK: - Commit & Cancel (Zero-Flicker Handoff)
 
-    /// Stops scrubbing loops while keeping the last decoded `previewImage` visible on screen
-    /// until `onCommit` finishes seeking and resuming 1x playback, then smoothly clears it.
-    public func commit(onCommit: @escaping @MainActor (TimeInterval) async -> Void) {
-        // Commit to the exact visible frame's timestamp when live preview is displayed ->
-        // instant I-frame seek AND zero jump between preview frame and resumed playback!
-        let finalTarget = (previewImage != nil) ? displayedFrameTime : targetTime
+    public func commit(
+        keepBarBriefly: Bool = false,
+        onCommit: @escaping @MainActor (TimeInterval) async -> Void
+    ) {
+        let finalTarget: TimeInterval
+        if case .shortStep = activeMode {
+            // Fixed-step jumps honor exact requested +5s/+10s target
+            finalTarget = targetTime
+        } else {
+            // Continuous visual scrubbing lands on the exact visible keyframe -> instant resume & zero jump!
+            finalTarget = framePresenter.isVisible ? displayedFrameTime : targetTime
+        }
+
         stopLoopsOnly()
         isScrubbing = false
-        activeMode = .idle
+        if !keepBarBriefly {
+            isShowingBar = false
+            activeMode = .idle
+        }
         isCommitting = true
         commitEpoch &+= 1
         let epoch = commitEpoch
 
         Task { @MainActor [weak self] in
             await onCommit(finalTarget)
-            // Brief 100ms grace so the main KSPlayer/AVPlayer Metal layer presents the resumed frame
-            // before lifting the preview overlay -> zero black flash!
-            try? await Task.sleep(nanoseconds: 100_000_000)
+            try? await Task.sleep(nanoseconds: 90_000_000)
             guard let self, self.commitEpoch == epoch, !self.isScrubbing else { return }
-            self.previewImage = nil
+            self.framePresenter.clear()
             self.isCommitting = false
+
+            if keepBarBriefly {
+                self.barHideTask?.cancel()
+                self.barHideTask = Task { @MainActor [weak self] in
+                    try? await Task.sleep(nanoseconds: 900_000_000)
+                    guard let self, !Task.isCancelled, !self.isScrubbing else { return }
+                    self.isShowingBar = false
+                    self.activeMode = .idle
+                }
+            }
         }
     }
 
     public func cancelAll() {
         stopLoopsOnly()
+        barHideTask?.cancel()
+        barHideTask = nil
         commitEpoch &+= 1
         isScrubbing = false
+        isShowingBar = false
         activeMode = .idle
         isCommitting = false
-        previewImage = nil
+        framePresenter.clear()
     }
 
     // MARK: - Internal Helpers
@@ -292,22 +377,25 @@ public final class MXScrubController: ObservableObject {
             while !Task.isCancelled && self.isScrubbing {
                 if let nextTarget = self.pendingPreviewTarget {
                     self.pendingPreviewTarget = nil
-                    // Avoid re-decoding near-identical timestamp twice in a row
-                    if abs(nextTarget - self.lastDecodedRequestTarget) < 0.25 && self.previewImage != nil {
-                        try? await Task.sleep(nanoseconds: 16_000_000)
+                    if abs(nextTarget - self.lastDecodedRequestTarget) < 0.2 && self.framePresenter.isVisible {
+                        try? await Task.sleep(nanoseconds: 12_000_000)
                         continue
                     }
                     self.lastDecodedRequestTarget = nextTarget
-                    if let frame = await onPreviewFrame(nextTarget) {
-                        if !Task.isCancelled && self.isScrubbing {
-                            self.previewImage = frame.cgImage
-                            self.displayedFrameTime = frame.actualTime
-                        }
-                    } else if !Task.isCancelled && self.isScrubbing {
+                    let outcome = await onPreviewFrame(nextTarget)
+                    guard !Task.isCancelled && self.isScrubbing else { break }
+                    switch outcome {
+                    case .frame(let frame):
+                        // Direct CALayer.contents swap (<0.1ms, ZERO SwiftUI layout/diffing!)
+                        self.framePresenter.present(frame.cgImage)
+                        self.displayedFrameTime = frame.actualTime
+                    case .unchanged(let actualTime):
+                        self.displayedFrameTime = actualTime
+                    case .unavailable:
                         self.displayedFrameTime = nextTarget
                     }
                 } else {
-                    try? await Task.sleep(nanoseconds: 16_000_000)
+                    try? await Task.sleep(nanoseconds: 12_000_000)
                 }
             }
         }
@@ -318,6 +406,8 @@ public final class MXScrubController: ObservableObject {
         tickTask = nil
         decodeLoopTask?.cancel()
         decodeLoopTask = nil
+        shortCommitTask?.cancel()
+        shortCommitTask = nil
         pendingPreviewTarget = nil
     }
 

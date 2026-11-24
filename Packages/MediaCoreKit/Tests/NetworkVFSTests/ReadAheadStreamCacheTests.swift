@@ -118,12 +118,16 @@ final class ReadAheadStreamCacheTests: XCTestCase {
         let head = try await cache.read(offset: 1024, length: 2048)
         XCTAssertEqual(head, Data(upstream.buffer[1024..<3072]))
 
-        // Middle uncached keyframe read bypasses 64KB chunking and fetches exact 12KB slice
-        let keyframe = try await cache.read(offset: Int64(chunkSize * 4 + 500), length: 12_000)
-        XCTAssertEqual(keyframe, Data(upstream.buffer[(chunkSize * 4 + 500)..<(chunkSize * 4 + 12_500)]))
+        // Middle uncached keyframe read uses 384KB scrub micro-buffer (1 upstream read)
+        let keyframe1 = try await cache.read(offset: Int64(chunkSize * 4 + 500), length: 12_000)
+        XCTAssertEqual(keyframe1, Data(upstream.buffer[(chunkSize * 4 + 500)..<(chunkSize * 4 + 12_500)]))
+
+        // Second consecutive slice of the same keyframe hits RAM micro-buffer with ZERO extra upstream reads!
+        let keyframe2 = try await cache.read(offset: Int64(chunkSize * 4 + 12_500), length: 12_000)
+        XCTAssertEqual(keyframe2, Data(upstream.buffer[(chunkSize * 4 + 12_500)..<(chunkSize * 4 + 24_500)]))
 
         let metrics = await cache.metrics()
-        XCTAssertEqual(metrics.directScrubReads, 1)
+        XCTAssertEqual(metrics.directScrubReads, 1, "Second sequential slice must hit scrub micro-buffer in RAM")
         let middleCached = await cache.isChunkCached(4)
         XCTAssertFalse(middleCached, "Scrub bypass must not wastefully populate 2MB cache chunks")
         await cache.close()

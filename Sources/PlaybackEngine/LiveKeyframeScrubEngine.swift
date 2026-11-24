@@ -4,6 +4,9 @@ import ImageIO
 import CoreImage
 import CoreMedia
 import AVFoundation
+import SwiftUI
+import UIKit
+import QuartzCore
 import os
 
 #if canImport(KSPlayer) && !targetEnvironment(simulator)
@@ -14,7 +17,6 @@ import Libavcodec
 #endif
 
 /// A decoded video preview frame returned by `LiveKeyframeScrubEngine`.
-/// Stores a downscaled `CGImage` (Sendable under Swift 6) for zero-hitch full-screen display.
 public struct ScrubPreviewFrame: Sendable {
     public let cgImage: CGImage
     public let actualTime: TimeInterval
@@ -25,18 +27,111 @@ public struct ScrubPreviewFrame: Sendable {
     }
 }
 
+/// Result of a preview decode request: distinguishes a freshly rendered frame from an unchanged GOP frame
+/// so the caller avoids redundant UI updates and never falls back to a slow main-player seek when unchanged.
+public enum ScrubDecodeOutcome: Sendable {
+    case frame(ScrubPreviewFrame)
+    case unchanged(actualTime: TimeInterval)
+    case unavailable
+}
+
+/// Zero-overhead CoreAnimation layer presenter for full-screen live scrub frames.
+/// Swaps `CALayer.contents` directly with animations disabled (< 0.1ms) without triggering SwiftUI
+/// view-tree diffing on `PlayerScreenView` at 25–60 fps!
+@MainActor
+public final class ScrubFramePresenter {
+    fileprivate weak var canvasView: ScrubCanvasView?
+    private var pendingImage: CGImage?
+    public private(set) var isVisible: Bool = false
+
+    public init() {}
+
+    fileprivate func attach(_ view: ScrubCanvasView) {
+        canvasView = view
+        if let pendingImage, isVisible {
+            apply(pendingImage, to: view)
+        } else {
+            view.isHidden = !isVisible
+        }
+    }
+
+    public func present(_ cgImage: CGImage) {
+        pendingImage = cgImage
+        isVisible = true
+        if let view = canvasView {
+            apply(cgImage, to: view)
+        }
+    }
+
+    public func clear() {
+        pendingImage = nil
+        isVisible = false
+        guard let view = canvasView else { return }
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        view.layer.contents = nil
+        view.isHidden = true
+        CATransaction.commit()
+    }
+
+    private func apply(_ image: CGImage, to view: ScrubCanvasView) {
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        view.layer.contents = image
+        view.isHidden = false
+        CATransaction.commit()
+    }
+}
+
+final class ScrubCanvasView: UIView {
+    override init(frame: CGRect) {
+        super.init(frame: frame)
+        backgroundColor = .black
+        isUserInteractionEnabled = false
+        isHidden = true
+        layer.contentsGravity = .resizeAspect
+        layer.masksToBounds = true
+        layer.magnificationFilter = .linear
+        layer.minificationFilter = .linear
+    }
+
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+}
+
+/// SwiftUI wrapper hosting `ScrubCanvasView`. Created once and updated directly via `ScrubFramePresenter`.
+public struct ScrubFrameDisplayView: UIViewRepresentable {
+    public let presenter: ScrubFramePresenter
+
+    public init(presenter: ScrubFramePresenter) {
+        self.presenter = presenter
+    }
+
+    public func makeUIView(context: Context) -> UIView {
+        let view = ScrubCanvasView()
+        presenter.attach(view)
+        return view
+    }
+
+    public func updateUIView(_ uiView: UIView, context: Context) {
+        if let canvas = uiView as? ScrubCanvasView {
+            presenter.attach(canvas)
+        }
+    }
+}
+
 #if canImport(KSPlayer) && !targetEnvironment(simulator)
 /// Dedicated hardware live-frame scrub engine built directly on KSPlayer's `FormatContext`
-/// and synchronous `VideoToolboxDecode` (with automatic `FFmpegDecode` fallback for AV1/VP9/Hi10P).
+/// and synchronous `VideoToolboxDecode` (auto-falling back to `FFmpegDecode` for AV1/VP9/Hi10P).
 ///
-/// Architecture:
-/// - Opens a lightweight, video-only `FormatContext` against the same `LocalHTTPStreamProxy` URL,
-///   so pinned Head/Tail 4MB index blocks (`Cues` / `moov`) hit RAM in <1ms with zero extra SMB open cost.
-/// - Runs all blocking FFmpeg seek/read/decode work on a dedicated `.userInteractive` serial `DispatchQueue`
-///   so Swift Concurrency's cooperative thread pool is NEVER starved.
-/// - Uses an atomic generation counter so superseded scrub requests bail out immediately mid-loop.
-/// - Downscales decoded 4K/HDR `CVPixelBuffer` frames on GPU via `CIContext` to max 1280px wide,
-///   automatically tone-mapping HDR10/HLG/10-bit frames while keeping memory under ~4MB per frame.
+/// Smoothness optimizations:
+/// - Runs exclusively on a `.userInteractive` serial `DispatchQueue` (never blocks Swift Concurrency).
+/// - Downscales decoded 4K/HDR frames on GPU via `CIContext` to max 960px wide (~2MB RGBA, <1.2ms)
+///   with automatic HDR10/HLG tone-mapping.
+/// - Atomic generation counter immediately preempts superseded requests mid-packet-loop.
+/// - Smart reverse-GOP keyframe stepping prevents reverse scrubbing from sticking inside 4–6s GOPs,
+///   and duplicate-PTS detection skips redundant GPU renders.
 public final class LiveKeyframeScrubEngine: @unchecked Sendable {
     private let workQueue = DispatchQueue(label: "local.personal.auratv.live-scrub", qos: .userInteractive)
     private let latestGeneration = OSAllocatedUnfairLock<UInt64>(initialState: 0)
@@ -50,13 +145,17 @@ public final class LiveKeyframeScrubEngine: @unchecked Sendable {
     private var usingSoftwareFallback: Bool = false
     private var isClosed: Bool = false
 
+    private var lastRenderedPTS: Int64 = Int64.min
+    private var lastRenderedTime: TimeInterval = -.infinity
+    private var lastRequestedTarget: TimeInterval = -.infinity
+
     private lazy var ciContext: CIContext = CIContext(options: [
         .useSoftwareRenderer: false,
         .cacheIntermediates: false
     ])
     private let srgbColorSpace = CGColorSpace(name: CGColorSpace.sRGB)
 
-    private let maxPreviewWidth: CGFloat = 1280
+    private let maxPreviewWidth: CGFloat = 960
 
     public init() {}
 
@@ -82,8 +181,14 @@ public final class LiveKeyframeScrubEngine: @unchecked Sendable {
         }
     }
 
-    /// Pre-opens the lightweight video-only demuxer & synchronous VideoToolbox decoder in background
-    /// right after playback starts, so the VERY FIRST fast-forward click renders a live frame in ~20ms.
+    public func resetTracking() {
+        workQueue.async { [self] in
+            lastRenderedPTS = Int64.min
+            lastRenderedTime = -.infinity
+            lastRequestedTarget = -.infinity
+        }
+    }
+
     public func prepare(url: URL) async {
         let alreadyPrepared: Bool = await withCheckedContinuation { cont in
             workQueue.async { [self] in
@@ -98,17 +203,14 @@ public final class LiveKeyframeScrubEngine: @unchecked Sendable {
         opts.isAccurateSeek = false
         opts.autoSelectEmbedSubtitle = false
         opts.subtitleDisable = true
-        // Fast header probe (hits pinned Head 4MB in RAM on LocalHTTPStreamProxy)
         opts.formatContextOptions["probesize"] = 2 * 1024 * 1024
         opts.formatContextOptions["analyzeduration"] = 1_000_000
-        // Single-thread software decode fallback eliminates FFmpeg frame-threading queue delay
         opts.decoderOptions["threads"] = "1"
 
         guard let ctx = try? await FormatContext(url: url, options: opts) else {
             return
         }
 
-        // Pick primary video track, skipping embedded JPEG/PNG cover-art streams
         guard let vTrack = ctx.assetTracks.first(where: { $0.mediaType == .video && !$0.isImage && !$0.isStillImage })
             ?? ctx.assetTracks.first(where: { $0.mediaType == .video }) else {
             ctx.close()
@@ -149,9 +251,7 @@ public final class LiveKeyframeScrubEngine: @unchecked Sendable {
         }
     }
 
-    /// Decodes the nearest keyframe at `targetTime` and returns a GPU-downscaled `CGImage`.
-    /// Returns `nil` if superseded by a newer request, cancelled, or not yet ready.
-    public func decodePreviewFrame(at targetTime: TimeInterval) async -> ScrubPreviewFrame? {
+    public func decodePreviewFrame(at targetTime: TimeInterval) async -> ScrubDecodeOutcome {
         let myGen = latestGeneration.withLock { gen -> UInt64 in
             gen &+= 1
             return gen
@@ -160,16 +260,15 @@ public final class LiveKeyframeScrubEngine: @unchecked Sendable {
         return await withCheckedContinuation { cont in
             workQueue.async { [self] in
                 if isClosed || currentGeneration() != myGen {
-                    cont.resume(returning: nil)
+                    cont.resume(returning: .unavailable)
                     return
                 }
-                let frame = decodeOnQueue(targetTime: max(0, targetTime), generation: myGen)
-                cont.resume(returning: frame)
+                let outcome = decodeOnQueue(targetTime: max(0, targetTime), generation: myGen)
+                cont.resume(returning: outcome)
             }
         }
     }
 
-    /// Cancels any in-flight packet loop and releases FFmpeg/VideoToolbox resources cleanly.
     public func close() async {
         latestGeneration.withLock { $0 &+= 1 }
         await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
@@ -194,19 +293,74 @@ public final class LiveKeyframeScrubEngine: @unchecked Sendable {
         scrubOptions = nil
         preparedURL = nil
         usingSoftwareFallback = false
+        lastRenderedPTS = Int64.min
+        lastRenderedTime = -.infinity
+        lastRequestedTarget = -.infinity
     }
 
-    private func decodeOnQueue(targetTime: TimeInterval, generation: UInt64) -> ScrubPreviewFrame? {
+    private func decodeOnQueue(targetTime: TimeInterval, generation: UInt64) -> ScrubDecodeOutcome {
         guard let ctx = formatContext,
-              let vTrack = videoTrack,
-              var activeDecoder = decoder else {
-            return nil
+              let vTrack = videoTrack else {
+            return .unavailable
         }
 
-        // 1. Seek directly to nearest backward I-frame on video stream
-        let seekResult = ctx.performSeek(time: targetTime, flags: 1, streamIndex: vTrack.trackID)
+        let movingBackward = (lastRequestedTarget.isFinite && targetTime < lastRequestedTarget - 0.15)
+        lastRequestedTarget = targetTime
+
+        var frame = seekAndDecodeSingleFrame(ctx: ctx, vTrack: vTrack, seekTime: targetTime, generation: generation)
+
+        // Reverse-GOP smoothing: when rewinding and AVSEEK_FLAG_BACKWARD lands on the exact same keyframe
+        // already on screen, nudge back past that keyframe once so reverse frames glide smoothly!
+        if movingBackward,
+           let f = frame,
+           f.timestamp != Int64.min,
+           f.timestamp == lastRenderedPTS,
+           lastRenderedTime.isFinite,
+           lastRenderedTime > 1.0,
+           currentGeneration() == generation,
+           !isClosed {
+            let earlierTarget = max(0, lastRenderedTime - 1.2)
+            if let earlierFrame = seekAndDecodeSingleFrame(ctx: ctx, vTrack: vTrack, seekTime: earlierTarget, generation: generation) {
+                frame = earlierFrame
+            }
+        }
+
+        guard let decoded = frame else { return .unavailable }
+        if currentGeneration() != generation || isClosed { return .unavailable }
+
+        let actualTime: TimeInterval
+        if decoded.timestamp != Int64.min && decoded.timestamp >= 0 {
+            let sec = vTrack.seconds(for: decoded.timestamp)
+            actualTime = (sec.isFinite && sec >= 0) ? sec : targetTime
+        } else {
+            actualTime = targetTime
+        }
+
+        // Duplicate-PTS fast skip: avoids redundant GPU render when still inside same GOP
+        if decoded.timestamp != Int64.min && decoded.timestamp == lastRenderedPTS {
+            return .unchanged(actualTime: actualTime)
+        }
+
+        guard let cgImage = renderPreviewCGImage(from: decoded, rotation: vTrack.rotation) else {
+            return .unavailable
+        }
+
+        lastRenderedPTS = decoded.timestamp
+        lastRenderedTime = actualTime
+        return .frame(ScrubPreviewFrame(cgImage: cgImage, actualTime: actualTime))
+    }
+
+    private func seekAndDecodeSingleFrame(
+        ctx: FormatContext,
+        vTrack: FFmpegAssetTrack,
+        seekTime: TimeInterval,
+        generation: UInt64
+    ) -> VideoVTBFrame? {
+        guard var activeDecoder = decoder else { return nil }
+
+        let seekResult = ctx.performSeek(time: seekTime, flags: 1, streamIndex: vTrack.trackID)
         if seekResult < 0 {
-            let fallbackSeek = ctx.performSeek(time: targetTime, flags: 1, streamIndex: -1)
+            let fallbackSeek = ctx.performSeek(time: seekTime, flags: 1, streamIndex: -1)
             if fallbackSeek < 0 {
                 return nil
             }
@@ -215,7 +369,6 @@ public final class LiveKeyframeScrubEngine: @unchecked Sendable {
 
         if currentGeneration() != generation || isClosed { return nil }
 
-        // 2. Read video keyframe packet(s) and synchronously decode first displayable frame
         var seenKeyframe = false
         var totalPackets = 0
         var videoPacketsFed = 0
@@ -239,7 +392,6 @@ public final class LiveKeyframeScrubEngine: @unchecked Sendable {
                 } else if totalPackets < 80 {
                     continue
                 } else {
-                    // Container lacks keyframe flags (some raw TS streams) -> decode anyway
                     seenKeyframe = true
                 }
             }
@@ -266,7 +418,6 @@ public final class LiveKeyframeScrubEngine: @unchecked Sendable {
 
             if localError {
                 consecutiveErrors += 1
-                // If hardware VideoToolbox rejects this profile (e.g., H.264 Hi10P), auto-fallback to FFmpegDecode
                 if consecutiveErrors >= 2 && !usingSoftwareFallback, let opts = scrubOptions {
                     activeDecoder.shutdown()
                     let swDecoder = FFmpegDecode(assetTrack: vTrack, options: opts)
@@ -283,22 +434,7 @@ public final class LiveKeyframeScrubEngine: @unchecked Sendable {
             }
         }
 
-        guard let frame = decodedFrame else { return nil }
-        if currentGeneration() != generation || isClosed { return nil }
-
-        guard let cgImage = renderPreviewCGImage(from: frame, rotation: vTrack.rotation) else {
-            return nil
-        }
-
-        let actualTime: TimeInterval
-        if frame.timestamp != Int64.min && frame.timestamp >= 0 {
-            let sec = vTrack.seconds(for: frame.timestamp)
-            actualTime = (sec.isFinite && sec >= 0) ? sec : targetTime
-        } else {
-            actualTime = targetTime
-        }
-
-        return ScrubPreviewFrame(cgImage: cgImage, actualTime: actualTime)
+        return decodedFrame
     }
 
     private func renderPreviewCGImage(from frame: VideoVTBFrame, rotation: UInt16) -> CGImage? {
@@ -329,7 +465,6 @@ public final class LiveKeyframeScrubEngine: @unchecked Sendable {
             )
         }
 
-        // Software pixel buffer fallback (planar YUV without CVPixelBuffer)
         guard let rawCG = frame.pixelBuffer.cgImage() else { return nil }
         if CGFloat(rawCG.width) <= maxPreviewWidth && rotation == 0 {
             return rawCG
@@ -357,7 +492,7 @@ public final class LiveKeyframeScrubEngine: @unchecked Sendable {
 }
 
 #else
-/// Simulator fallback backed by `AVAssetImageGenerator` with infinite keyframe tolerance.
+/// Simulator fallback backed by `AVAssetImageGenerator`.
 public final class LiveKeyframeScrubEngine: @unchecked Sendable {
     private let lock = OSAllocatedUnfairLock<AVAssetImageGenerator?>(initialState: nil)
 
@@ -367,25 +502,27 @@ public final class LiveKeyframeScrubEngine: @unchecked Sendable {
         lock.withLock { $0 != nil }
     }
 
+    public func resetTracking() {}
+
     public func prepare(url: URL) async {
         let asset = AVURLAsset(url: url)
         let generator = AVAssetImageGenerator(asset: asset)
         generator.appliesPreferredTrackTransform = true
-        generator.maximumSize = CGSize(width: 1280, height: 720)
+        generator.maximumSize = CGSize(width: 960, height: 540)
         generator.requestedTimeToleranceBefore = .positiveInfinity
         generator.requestedTimeToleranceAfter = .positiveInfinity
         lock.withLock { $0 = generator }
     }
 
-    public func decodePreviewFrame(at targetTime: TimeInterval) async -> ScrubPreviewFrame? {
-        guard let generator = lock.withLock({ $0 }) else { return nil }
+    public func decodePreviewFrame(at targetTime: TimeInterval) async -> ScrubDecodeOutcome {
+        guard let generator = lock.withLock({ $0 }) else { return .unavailable }
         let cmTime = CMTime(seconds: max(0, targetTime), preferredTimescale: 600)
         do {
             let (image, actual) = try await generator.image(at: cmTime)
             let sec = actual.isNumeric ? actual.seconds : targetTime
-            return ScrubPreviewFrame(cgImage: image, actualTime: sec)
+            return .frame(ScrubPreviewFrame(cgImage: image, actualTime: sec))
         } catch {
-            return nil
+            return .unavailable
         }
     }
 

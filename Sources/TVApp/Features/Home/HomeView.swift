@@ -19,14 +19,13 @@ struct HomeView: View {
     @StateObject private var discovery = BonjourDiscoveryService()
     @State private var browserTarget: BrowserTarget?
     @State private var playbackRequest: PlaybackRequest?
-    @State private var editingSource: MediaSourceConfig?
 
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 34) {
                 header
 
-                if !env.continueWatching.isEmpty {
+                if env.settings.enableResumePlayback && !env.continueWatching.isEmpty {
                     continueWatchingSection
                 }
 
@@ -40,10 +39,7 @@ struct HomeView: View {
         .task { await env.reload() }
         .onDisappear { discovery.stop() }
         .fullScreenCover(item: $browserTarget) { target in
-            FileBrowserView(target: target, onPlay: { request in
-                browserTarget = nil
-                playbackRequest = request
-            })
+            FileBrowserView(target: target)
         }
         .fullScreenCover(item: $playbackRequest) { request in
             PlayerScreenView(request: request)
@@ -55,7 +51,7 @@ struct HomeView: View {
             Text("AuraTV")
                 .font(.system(size: 64, weight: .heavy))
                 .foregroundStyle(.white)
-            Text("局域网影视库 · SMB / WebDAV · 原生 HDR 与 MX 长按快进")
+            Text("局域网影视库 · SMB / WebDAV · 原生 HDR 与 MX 丝滑快进")
                 .font(.system(size: 24, weight: .medium))
                 .foregroundStyle(TVTheme.secondaryText)
         }
@@ -70,7 +66,10 @@ struct HomeView: View {
                         Button {
                             replay(record)
                         } label: {
-                            ContinueWatchingCard(record: record)
+                            ContinueWatchingCard(
+                                record: record,
+                                barColor: Color(hex: env.settings.scrubBarColorHex)
+                            )
                         }
                         .buttonStyle(.plain)
                     }
@@ -82,9 +81,9 @@ struct HomeView: View {
 
     private var sourcesSection: some View {
         VStack(alignment: .leading, spacing: 14) {
-            sectionTitle("我的网络源")
+            sectionTitle("我的网络源（已记住）")
             if env.sources.isEmpty {
-                Text("还没有网络源。按「网络源」标签页添加 SMB 或 WebDAV，或在下方局域网发现里一键添加。")
+                Text("还没有网络源。按「网络源」标签页添加 SMB 或 WebDAV，或在下方局域网发现里一键连接（连上后会自动记住）。")
                     .font(.system(size: 22))
                     .foregroundStyle(TVTheme.tertiaryText)
                     .padding(.vertical, 18)
@@ -94,7 +93,10 @@ struct HomeView: View {
                         Button {
                             browserTarget = BrowserTarget(source: source)
                         } label: {
-                            SourceCard(source: source)
+                            SourceCard(
+                                source: source,
+                                isConnected: env.connectedSourceIDs.contains(source.id)
+                            )
                         }
                         .buttonStyle(.plain)
                     }
@@ -105,7 +107,7 @@ struct HomeView: View {
 
     private var discoverySection: some View {
         VStack(alignment: .leading, spacing: 14) {
-            sectionTitle("局域网发现")
+            sectionTitle("局域网发现（点一次即自动记住并进入）")
             if discovery.discoveredHosts.isEmpty {
                 HStack(spacing: 12) {
                     ProgressView()
@@ -117,16 +119,28 @@ struct HomeView: View {
             } else {
                 LazyVGrid(columns: [GridItem(.adaptive(minimum: 360), spacing: 18)], spacing: 18) {
                     ForEach(discovery.discoveredHosts) { host in
+                        let remembered = env.isDiscoveredHostRemembered(host)
                         Button {
-                            addDiscovered(host)
+                            connectAndRememberDiscovered(host)
                         } label: {
                             HStack(spacing: 14) {
                                 Image(systemName: host.protocolType == "smb" ? "externaldrive.fill" : "network")
                                     .font(.system(size: 26))
+                                    .foregroundStyle(remembered ? .green : TVTheme.accent)
                                 VStack(alignment: .leading, spacing: 4) {
-                                    Text(host.serviceName)
-                                        .font(.system(size: 22, weight: .semibold))
-                                        .lineLimit(1)
+                                    HStack(spacing: 8) {
+                                        Text(host.serviceName)
+                                            .font(.system(size: 22, weight: .semibold))
+                                            .lineLimit(1)
+                                        if remembered {
+                                            Text("已记住")
+                                                .font(.system(size: 13, weight: .bold))
+                                                .foregroundStyle(.green)
+                                                .padding(.horizontal, 8)
+                                                .padding(.vertical, 2)
+                                                .background(Color.green.opacity(0.18), in: Capsule())
+                                        }
+                                    }
                                     Text("\(host.hostName):\(host.port) · \(host.protocolType.uppercased())")
                                         .font(.system(size: 17))
                                         .foregroundStyle(TVTheme.secondaryText)
@@ -149,16 +163,11 @@ struct HomeView: View {
             .foregroundStyle(.white.opacity(0.9))
     }
 
-    private func addDiscovered(_ host: DiscoveredLANHost) {
-        let config = MediaSourceConfig(
-            displayName: host.serviceName,
-            protocolType: host.protocolType == "smb" ? .smb : .webdav,
-            host: host.hostName,
-            port: host.port,
-            useTLS: host.protocolType == "webdav" && host.port == 443,
-            basePath: "/"
-        )
-        Task { try? await env.upsert(source: config, password: nil) }
+    private func connectAndRememberDiscovered(_ host: DiscoveredLANHost) {
+        Task {
+            let saved = await env.rememberDiscoveredHost(host)
+            browserTarget = BrowserTarget(source: saved)
+        }
     }
 
     private func replay(_ record: PlaybackHistoryRecord) {
@@ -171,16 +180,18 @@ struct HomeView: View {
             size: 0,
             modifiedAt: record.lastPlayedAt
         )
+        let resumeAt = env.settings.enableResumePlayback ? record.lastPositionSeconds : 0
         playbackRequest = PlaybackRequest(
             source: source,
             item: item,
-            resumeAt: record.lastPositionSeconds
+            resumeAt: resumeAt
         )
     }
 }
 
 struct SourceCard: View {
     let source: MediaSourceConfig
+    var isConnected: Bool = false
     @FocusState private var focused: Bool
 
     var body: some View {
@@ -189,9 +200,16 @@ struct SourceCard: View {
                 .font(.system(size: 40))
                 .foregroundStyle(TVTheme.accent)
             VStack(alignment: .leading, spacing: 6) {
-                Text(source.displayName)
-                    .font(.system(size: 26, weight: .semibold))
-                    .lineLimit(1)
+                HStack(spacing: 10) {
+                    Text(source.displayName)
+                        .font(.system(size: 26, weight: .semibold))
+                        .lineLimit(1)
+                    if isConnected {
+                        Circle()
+                            .fill(Color.green)
+                            .frame(width: 9, height: 9)
+                    }
+                }
                 Text("\(source.protocolType.rawValue.uppercased()) · \(source.host)\(source.port.map { ":\($0)" } ?? "")")
                     .font(.system(size: 18))
                     .foregroundStyle(TVTheme.secondaryText)
@@ -208,6 +226,7 @@ struct SourceCard: View {
 
 struct ContinueWatchingCard: View {
     let record: PlaybackHistoryRecord
+    var barColor: Color = TVTheme.accent
     @FocusState private var focused: Bool
 
     var body: some View {
@@ -217,7 +236,7 @@ struct ContinueWatchingCard: View {
                 .lineLimit(2)
                 .frame(width: 360, height: 62, alignment: .leading)
             ProgressView(value: min(max(record.progressRatio, 0), 1))
-                .tint(TVTheme.accent)
+                .tint(barColor)
                 .frame(width: 360)
             Text("剩余 \(formatted(record.remainingSeconds))")
                 .font(.system(size: 16))
