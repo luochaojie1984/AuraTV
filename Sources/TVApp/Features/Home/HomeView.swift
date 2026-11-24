@@ -105,20 +105,6 @@ struct HomeView: View {
                 .foregroundStyle(.white)
 
             Spacer()
-
-            if !env.sources.isEmpty {
-                Button {
-                    isAddingSource = true
-                } label: {
-                    Label("添加服务器", systemImage: "plus")
-                        .font(.system(size: 18, weight: .semibold))
-                        .foregroundStyle(.white.opacity(0.92))
-                        .padding(.horizontal, 20)
-                        .padding(.vertical, 10)
-                        .background(Color.white.opacity(0.10), in: Capsule())
-                }
-                .buttonStyle(TVOptionButtonStyle())
-            }
         }
     }
 
@@ -206,6 +192,7 @@ struct HomeView: View {
             Spacer()
         }
         .padding(.top, 20)
+        .focusSection()
     }
 
     // MARK: - Populated Sections
@@ -231,6 +218,7 @@ struct HomeView: View {
                 .padding(.horizontal, 6)
             }
         }
+        .focusSection()
     }
 
     private var sourcesSection: some View {
@@ -248,8 +236,42 @@ struct HomeView: View {
                     }
                     .buttonStyle(TVCardButtonStyle())
                 }
+
+                Button {
+                    isAddingSource = true
+                } label: {
+                    addServerTile
+                }
+                .buttonStyle(TVCardButtonStyle())
             }
         }
+        .focusSection()
+    }
+
+    private var addServerTile: some View {
+        HStack(spacing: 18) {
+            RoundedRectangle(cornerRadius: 16, style: .continuous)
+                .fill(Color.white.opacity(0.08))
+                .frame(width: 64, height: 64)
+                .overlay(
+                    Image(systemName: "plus")
+                        .font(.system(size: 28, weight: .semibold))
+                        .foregroundStyle(TVTheme.accent)
+                )
+
+            VStack(alignment: .leading, spacing: 6) {
+                Text("添加服务器")
+                    .font(.system(size: 24, weight: .semibold))
+                    .foregroundStyle(.white)
+                Text("SMB / WebDAV")
+                    .font(.system(size: 16))
+                    .foregroundStyle(TVTheme.secondaryText)
+            }
+            Spacer()
+        }
+        .padding(.horizontal, 22)
+        .padding(.vertical, 20)
+        .frame(height: 124)
     }
 
     private var discoverySection: some View {
@@ -289,6 +311,7 @@ struct HomeView: View {
                 }
             }
         }
+        .focusSection()
     }
 
     private func sectionTitle(_ text: String) -> some View {

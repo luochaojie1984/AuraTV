@@ -1,5 +1,6 @@
 import Foundation
 import os
+import Network
 import AMSMB2
 import NetworkVFS
 
@@ -56,20 +57,211 @@ public final class AMSMB2Provider: VFSProvider, @unchecked Sendable {
         return manager
     }
 
-    public func connect() async throws {
-        var cleanHost = config.host.trimmingCharacters(in: .whitespacesAndNewlines)
-        if cleanHost.lowercased().hasPrefix("smb://") {
-            cleanHost = String(cleanHost.dropFirst("smb://".count))
+    private static func parseHostAndPort(rawHost: String, configuredPort: Int?) -> (networkHost: String, urlHost: String, effectivePort: Int?) {
+        var clean = rawHost.trimmingCharacters(in: .whitespacesAndNewlines)
+        if clean.lowercased().hasPrefix("smb://") {
+            clean = String(clean.dropFirst("smb://".count))
         }
-        while cleanHost.hasSuffix("/") {
-            cleanHost.removeLast()
+        while clean.hasSuffix("/") {
+            clean.removeLast()
         }
-        if !cleanHost.hasPrefix("[") && cleanHost.contains(":") {
-            cleanHost = "[\(cleanHost)]"
+        clean = clean.trimmingCharacters(in: .whitespacesAndNewlines)
+
+        var networkHost = clean
+        var urlHost = clean
+        var inlinePort: Int?
+
+        if clean.hasPrefix("["), let closeIdx = clean.firstIndex(of: "]") {
+            let inside = String(clean[clean.index(after: clean.startIndex)..<closeIdx])
+            let after = clean[clean.index(after: closeIdx)...]
+            if after.hasPrefix(":"), let p = Int(after.dropFirst()), (1...65535).contains(p) {
+                inlinePort = p
+            }
+            networkHost = inside
+            urlHost = "[\(inside)]"
+        } else {
+            let colonCount = clean.filter { $0 == ":" }.count
+            if colonCount == 1, let idx = clean.firstIndex(of: ":") {
+                let hostPart = String(clean[..<idx]).trimmingCharacters(in: .whitespacesAndNewlines)
+                let portPart = String(clean[clean.index(after: idx)...]).trimmingCharacters(in: .whitespacesAndNewlines)
+                if !hostPart.isEmpty, let p = Int(portPart), (1...65535).contains(p) {
+                    networkHost = hostPart
+                    urlHost = hostPart
+                    inlinePort = p
+                }
+            } else if colonCount >= 2 {
+                networkHost = clean
+                urlHost = "[\(clean)]"
+            }
         }
 
-        let portSuffix = config.port.flatMap { $0 == 445 ? nil : ":\($0)" } ?? ""
-        let urlString = "smb://\(cleanHost)\(portSuffix)"
+        return (networkHost, urlHost, configuredPort ?? inlinePort)
+    }
+
+    private final class TCPPreflightCoordinator: @unchecked Sendable {
+        private struct State {
+            var finished = false
+            var lastWaitingMessage: String?
+            var timeoutItem: DispatchWorkItem?
+        }
+
+        private let lock = OSAllocatedUnfairLock<State>(initialState: State())
+        private let connection: NWConnection
+        private let queue = DispatchQueue(label: "auratv.smb.preflight")
+        private let host: String
+        private let port: Int
+
+        init(host: String, port: Int, nwPort: NWEndpoint.Port) {
+            self.host = host
+            self.port = port
+            self.connection = NWConnection(host: NWEndpoint.Host(host), port: nwPort, using: .tcp)
+        }
+
+        func run(timeoutSeconds: TimeInterval) async throws {
+            try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, any Error>) in
+                let work = DispatchWorkItem { [weak self] in
+                    guard let self else { return }
+                    let waitingMsg: String? = self.lock.withLock { state in
+                        guard !state.finished else { return nil }
+                        state.finished = true
+                        state.timeoutItem = nil
+                        return state.lastWaitingMessage ?? ""
+                    }
+                    guard let waitingMsg else { return }
+                    self.connection.cancel()
+                    let message = waitingMsg.isEmpty
+                        ? "连接 \(self.host):\(self.port) 超时，请检查 IP 地址、端口及局域网连通性（以及 Apple TV「设置 → 隐私与安全性 → 本地网络」中 AuraTV 权限）"
+                        : waitingMsg
+                    continuation.resume(throwing: VFSError.ioFailure(message))
+                }
+
+                self.lock.withLock { $0.timeoutItem = work }
+
+                self.connection.stateUpdateHandler = { [weak self] nwState in
+                    guard let self else { return }
+                    switch nwState {
+                    case .ready:
+                        let (shouldResume, itemToCancel) = self.lock.withLock { state -> (Bool, DispatchWorkItem?) in
+                            guard !state.finished else { return (false, nil) }
+                            state.finished = true
+                            let item = state.timeoutItem
+                            state.timeoutItem = nil
+                            return (true, item)
+                        }
+                        guard shouldResume else { return }
+                        itemToCancel?.cancel()
+                        self.connection.cancel()
+                        continuation.resume()
+
+                    case .waiting(let nwError):
+                        let msg = AMSMB2Provider.describeNWError(nwError, host: self.host, port: self.port)
+                        self.lock.withLock { state in
+                            if !state.finished {
+                                state.lastWaitingMessage = msg
+                            }
+                        }
+
+                    case .failed(let nwError):
+                        let (shouldResume, itemToCancel) = self.lock.withLock { state -> (Bool, DispatchWorkItem?) in
+                            guard !state.finished else { return (false, nil) }
+                            state.finished = true
+                            let item = state.timeoutItem
+                            state.timeoutItem = nil
+                            return (true, item)
+                        }
+                        guard shouldResume else { return }
+                        itemToCancel?.cancel()
+                        self.connection.cancel()
+                        let msg = AMSMB2Provider.describeNWError(nwError, host: self.host, port: self.port)
+                        continuation.resume(throwing: VFSError.ioFailure(msg))
+
+                    case .cancelled:
+                        let (shouldResume, itemToCancel) = self.lock.withLock { state -> (Bool, DispatchWorkItem?) in
+                            guard !state.finished else { return (false, nil) }
+                            state.finished = true
+                            let item = state.timeoutItem
+                            state.timeoutItem = nil
+                            return (true, item)
+                        }
+                        if shouldResume {
+                            itemToCancel?.cancel()
+                            continuation.resume(throwing: VFSError.cancelled)
+                        }
+
+                    default:
+                        break
+                    }
+                }
+
+                self.queue.asyncAfter(deadline: .now() + timeoutSeconds, execute: work)
+                self.connection.start(queue: self.queue)
+            }
+        }
+    }
+
+    private static func preflightTCP(host: String, port: Int, timeoutSeconds: TimeInterval = 6.0) async throws {
+        guard !host.isEmpty,
+              (1...65535).contains(port),
+              let nwPort = NWEndpoint.Port(rawValue: UInt16(port)) else {
+            throw VFSError.invalidURL("smb://\(host):\(port)")
+        }
+        let coordinator = TCPPreflightCoordinator(host: host, port: port, nwPort: nwPort)
+        try await coordinator.run(timeoutSeconds: timeoutSeconds)
+    }
+
+    private static func describeNWError(_ error: NWError, host: String, port: Int) -> String {
+        switch error {
+        case .posix(let code):
+            switch code {
+            case .EPERM:
+                return "Apple TV 本地网络权限未开启（EPERM），请到 Apple TV「设置 → 隐私与安全性 → 本地网络」中开启 AuraTV 权限后重试"
+            case .ECONNREFUSED:
+                return "目标主机 \(host):\(port) 拒绝连接（请确认已开启 SMB 文件共享且防火墙放行 \(port) 端口）"
+            case .EHOSTUNREACH, .ENETUNREACH:
+                return "无法路由到 \(host)（请确认 Apple TV 与服务器在同一局域网且 IP 正确）"
+            default:
+                return "TCP 连接 \(host):\(port) 失败：\(error.localizedDescription) (POSIX \(code.rawValue))"
+            }
+        case .dns(let dnsError):
+            return "无法解析主机名 \(host)（DNS 错误 \(dnsError)），请改填局域网 IP 地址重试"
+        default:
+            return "TCP 连接 \(host):\(port) 失败：\(error.localizedDescription)"
+        }
+    }
+
+    private static func extractPOSIXCode(from error: any Error) -> Int32? {
+        if let posix = error as? POSIXError {
+            return Int32(posix.code.rawValue)
+        }
+        let nsError = error as NSError
+        if nsError.domain == NSPOSIXErrorDomain {
+            return Int32(nsError.code)
+        }
+        return nil
+    }
+
+    private static func classifyListSharesError(_ error: any Error) -> VFSError {
+        let rawDesc = error.localizedDescription.trimmingCharacters(in: .whitespacesAndNewlines)
+        let code = extractPOSIXCode(from: error)
+        if code == 1 || rawDesc.isEmpty || rawDesc == "Error code 1:" || rawDesc.hasPrefix("Error code 1:") {
+            let label = rawDesc.isEmpty ? "Error code 1" : rawDesc
+            return .ioFailure("SMB 认证或根目录共享枚举被断开（\(label)）。请检查：① 用户名与密码是否正确；② 若服务器限制根目录枚举（IPC$），请点「编辑账号密码」并在「路径 / 共享名」直接填具体共享文件夹名（如 /Movies）；③ 确认 Apple TV「设置 → 隐私与安全性 → 本地网络」已允许 AuraTV。")
+        }
+        if code == 13 || rawDesc.localizedCaseInsensitiveContains("ACCESS_DENIED") || rawDesc.localizedCaseInsensitiveContains("LOGON_FAILURE") {
+            return .ioFailure("SMB 账号密码验证失败或无访问权限（\(rawDesc)），请点击「编辑账号密码」核对凭据。")
+        }
+        return .ioFailure("读取根目录共享列表失败：\(rawDesc)")
+    }
+
+    public func connect() async throws {
+        let parsed = Self.parseHostAndPort(rawHost: config.host, configuredPort: config.port)
+        let tcpPort = parsed.effectivePort ?? 445
+
+        // Triggers tvOS Local Network authorization cleanly and surfaces clear socket errors before libsmb2 calls.
+        try await Self.preflightTCP(host: parsed.networkHost, port: tcpPort)
+
+        let portSuffix = parsed.effectivePort.flatMap { $0 == 445 ? nil : ":\($0)" } ?? ""
+        let urlString = "smb://\(parsed.urlHost)\(portSuffix)"
         guard let url = URL(string: urlString) else {
             throw VFSError.invalidURL(urlString)
         }
@@ -110,7 +302,13 @@ public final class AMSMB2Provider: VFSProvider, @unchecked Sendable {
         do {
             try await manager.connectShare(name: share)
         } catch {
-            throw VFSError.ioFailure("connectShare(\(share)) failed: \(error.localizedDescription)")
+            let rawDesc = error.localizedDescription.trimmingCharacters(in: .whitespacesAndNewlines)
+            let code = Self.extractPOSIXCode(from: error)
+            if code == 1 || rawDesc.isEmpty || rawDesc == "Error code 1:" || rawDesc.hasPrefix("Error code 1:") {
+                let label = rawDesc.isEmpty ? "Error code 1" : rawDesc
+                throw VFSError.ioFailure("连接共享目录 \(share) 失败（\(label)）。请检查：① 用户名与密码是否正确；② 共享名称（\(share)）是否存在且当前账号有权限访问；③ Apple TV「设置 → 隐私与安全性 → 本地网络」已开启 AuraTV 权限。")
+            }
+            throw VFSError.ioFailure("连接共享目录 \(share) 失败：\(rawDesc)")
         }
         stateLock.withLock { $0.connectedShare = share }
     }
@@ -168,7 +366,12 @@ public final class AMSMB2Provider: VFSProvider, @unchecked Sendable {
 
         guard let resolved = resolveShareAndRelativePath(path) else {
             // Server root: enumerate SMB shares
-            let shares = try await manager.listShares()
+            let shares: [(name: String, comment: String)]
+            do {
+                shares = try await manager.listShares()
+            } catch {
+                throw Self.classifyListSharesError(error)
+            }
             return shares
                 .filter { !$0.name.hasSuffix("$") }
                 .map { share in

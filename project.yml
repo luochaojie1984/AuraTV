@@ -9,7 +9,7 @@ packages:
     path: Packages/MediaCoreKit
   AMSMB2:
     url: https://github.com/amosavian/AMSMB2.git
-    exactVersion: 4.0.3
+    revision: 8d8e19ebeaf71cca1f66b3689034b58ba333c44f
   KSPlayer:
     url: https://github.com/kingslay/KSPlayer.git
     exactVersion: 5.6.2

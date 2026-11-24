@@ -19,6 +19,12 @@ struct FileBrowserView: View {
     @State private var playbackRequest: PlaybackRequest?
     @State private var showCredentialEditor = false
     @FocusState private var focusedItemID: String?
+    @FocusState private var errorFocusTarget: ErrorFocus?
+
+    private enum ErrorFocus: Hashable {
+        case retry
+        case editCredentials
+    }
 
     init(target: BrowserTarget) {
         self.target = target
@@ -62,14 +68,23 @@ struct FileBrowserView: View {
 
             VStack(spacing: 0) {
                 topBar
+                    .focusSection()
                 Divider().opacity(0.25)
 
-                HStack(alignment: .top, spacing: 0) {
-                    listPane
-                        .frame(maxWidth: .infinity, alignment: .leading)
+                if isLoading {
+                    loadingView
+                } else if let errorText {
+                    errorView(errorText)
+                } else {
+                    HStack(alignment: .top, spacing: 28) {
+                        listPane
+                            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+                            .focusSection()
 
-                    detailPane
-                        .frame(width: 520)
+                        detailPane
+                            .frame(width: 480)
+                    }
+                    .padding(.horizontal, TVMetrics.horizontalSafeMargin)
                 }
             }
         }
@@ -148,72 +163,126 @@ struct FileBrowserView: View {
         return "… / " + parts.suffix(2).joined(separator: " / ")
     }
 
+    private var loadingView: some View {
+        VStack(spacing: 18) {
+            ProgressView()
+            Text("正在连接并读取目录…")
+                .font(.system(size: 22))
+                .foregroundStyle(TVTheme.secondaryText)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+
+    private func errorView(_ errorText: String) -> some View {
+        VStack {
+            Spacer()
+            VStack(alignment: .leading, spacing: 22) {
+                HStack(spacing: 14) {
+                    Image(systemName: "exclamationmark.triangle.fill")
+                        .font(.system(size: 32))
+                        .foregroundStyle(.orange)
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("无法读取目录")
+                            .font(.system(size: 30, weight: .bold))
+                            .foregroundStyle(.white)
+                        Text("\(activeSource.protocolType.rawValue.uppercased()) · \(activeSource.host)\(activeSource.port.map { ":\($0)" } ?? "") · 路径 \(activeSource.basePath)")
+                            .font(.system(size: 18))
+                            .foregroundStyle(TVTheme.secondaryText)
+                    }
+                }
+
+                Text(errorText)
+                    .font(.system(size: 21))
+                    .foregroundStyle(.orange.opacity(0.95))
+                    .fixedSize(horizontal: false, vertical: true)
+                    .lineSpacing(5)
+
+                HStack(spacing: 18) {
+                    Button("重试") { Task { await reload(path: path, forceReconnect: true) } }
+                        .buttonStyle(.borderedProminent)
+                        .focused($errorFocusTarget, equals: .retry)
+                    Button("编辑账号密码") { showCredentialEditor = true }
+                        .buttonStyle(.bordered)
+                        .focused($errorFocusTarget, equals: .editCredentials)
+                    if path != "/" {
+                        Button("回到根目录") { Task { await reload(path: "/") } }
+                            .buttonStyle(.bordered)
+                    }
+                    Button("返回首页") {
+                        UISoundPlayer.shared.playBack()
+                        dismiss()
+                    }
+                    .buttonStyle(.bordered)
+                }
+                .padding(.top, 6)
+            }
+            .padding(44)
+            .frame(maxWidth: 1120, alignment: .leading)
+            .tvGlassSurface(cornerRadius: 28)
+            .focusSection()
+            Spacer()
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .padding(.horizontal, TVMetrics.horizontalSafeMargin)
+        .task {
+            await Task.yield()
+            errorFocusTarget = .editCredentials
+        }
+    }
+
     private var listPane: some View {
         ScrollView {
-            if isLoading {
-                ProgressView("正在读取目录…").padding(60)
-            } else if let errorText {
-                VStack(alignment: .leading, spacing: 16) {
-                    Text(errorText)
-                        .font(.system(size: 20))
-                        .foregroundStyle(.orange)
-                    HStack(spacing: 16) {
-                        Button("重试") { Task { await reload(path: path, forceReconnect: true) } }
-                            .buttonStyle(.borderedProminent)
-                        Button("编辑账号密码") { showCredentialEditor = true }
-                            .buttonStyle(.bordered)
-                        if path != "/" {
-                            Button("回到根目录") { Task { await reload(path: "/") } }
-                                .buttonStyle(.bordered)
-                        }
+            LazyVStack(alignment: .leading, spacing: 0) {
+                if path != "/" {
+                    Button {
+                        UISoundPlayer.shared.playBack()
+                        Task { await goUp() }
+                    } label: {
+                        row(id: "up", name: "⬅︎ 上一级", subtitle: "", isDir: true, badges: [], progress: nil)
                     }
+                    .buttonStyle(TVListRowButtonStyle())
                 }
-                .padding(60)
-            } else {
-                LazyVStack(alignment: .leading, spacing: 0) {
-                    if path != "/" {
-                        Button {
-                            UISoundPlayer.shared.playBack()
-                            Task { await goUp() }
-                        } label: {
-                            row(id: "up", name: "⬅︎ 上一级", subtitle: "", isDir: true, badges: [], progress: nil)
-                        }
-                        .buttonStyle(TVListRowButtonStyle())
-                    }
-                    ForEach(visibleItems) { item in
-                        let hist = item.isVideo ? env.historyRecord(for: activeSource.id, filePath: item.path) : nil
-                        let resumeRatio: Double? = (hist != nil && !hist!.isWatched && hist!.lastPositionSeconds >= 5) ? hist!.progressRatio : nil
-                        let subtitleText: String = {
-                            if item.isDirectory { return "文件夹" }
-                            let sizeStr = ByteCountFormatter.string(fromByteCount: item.size, countStyle: .file)
-                            if let hist, !hist.isWatched, hist.lastPositionSeconds >= 5 {
-                                return "\(sizeStr) · 上次看到 \(formatTime(hist.lastPositionSeconds))"
-                            }
-                            return sizeStr
-                        }()
 
-                        Button {
-                            open(item)
-                        } label: {
-                            row(
-                                id: item.id,
-                                name: item.name,
-                                subtitle: subtitleText,
-                                isDir: item.isDirectory,
-                                badges: item.isVideo ? VideoBadgeParser.badges(for: item.name) : [],
-                                progress: resumeRatio
-                            )
+                if visibleItems.isEmpty && path == "/" {
+                    Text("此目录为空")
+                        .font(.system(size: 22))
+                        .foregroundStyle(TVTheme.tertiaryText)
+                        .padding(.vertical, 32)
+                        .padding(.horizontal, 20)
+                }
+
+                ForEach(visibleItems) { item in
+                    let hist = item.isVideo ? env.historyRecord(for: activeSource.id, filePath: item.path) : nil
+                    let resumeRatio: Double? = (hist != nil && !hist!.isWatched && hist!.lastPositionSeconds >= 5) ? hist!.progressRatio : nil
+                    let subtitleText: String = {
+                        if item.isDirectory { return "文件夹" }
+                        let sizeStr = ByteCountFormatter.string(fromByteCount: item.size, countStyle: .file)
+                        if let hist, !hist.isWatched, hist.lastPositionSeconds >= 5 {
+                            return "\(sizeStr) · 上次看到 \(formatTime(hist.lastPositionSeconds))"
                         }
-                        .buttonStyle(TVListRowButtonStyle())
-                        .focused($focusedItemID, equals: item.id)
-                        .onChange(of: focusedItemID) { _, newValue in
-                            if newValue == item.id { focused = item }
-                        }
+                        return sizeStr
+                    }()
+
+                    Button {
+                        open(item)
+                    } label: {
+                        row(
+                            id: item.id,
+                            name: item.name,
+                            subtitle: subtitleText,
+                            isDir: item.isDirectory,
+                            badges: item.isVideo ? VideoBadgeParser.badges(for: item.name) : [],
+                            progress: resumeRatio
+                        )
+                    }
+                    .buttonStyle(TVListRowButtonStyle())
+                    .focused($focusedItemID, equals: item.id)
+                    .onChange(of: focusedItemID) { _, newValue in
+                        if newValue == item.id { focused = item }
                     }
                 }
-                .padding(.horizontal, TVMetrics.horizontalSafeMargin)
-                .padding(.vertical, 16)
             }
+            .padding(.vertical, 16)
         }
     }
 
@@ -304,9 +373,8 @@ struct FileBrowserView: View {
             Spacer()
         }
         .padding(28)
-        .frame(maxHeight: .infinity, alignment: .topLeading)
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
         .tvGlassSurface(cornerRadius: 22)
-        .padding(.trailing, TVMetrics.horizontalSafeMargin)
         .padding(.vertical, 20)
     }
 

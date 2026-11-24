@@ -23,35 +23,40 @@ struct SourceListView: View {
                     }
                     .buttonStyle(.borderedProminent)
                 }
+                .focusSection()
 
-                if env.sources.isEmpty {
-                    Text("尚未添加任何网络源。")
-                        .font(.system(size: 22))
-                        .foregroundStyle(TVTheme.tertiaryText)
-                        .padding(.vertical, 30)
-                }
+                VStack(alignment: .leading, spacing: 20) {
+                    if env.sources.isEmpty {
+                        Text("尚未添加任何网络源。")
+                            .font(.system(size: 22))
+                            .foregroundStyle(TVTheme.tertiaryText)
+                            .padding(.vertical, 30)
+                    }
 
-                ForEach(env.sources) { source in
-                    HStack(spacing: 20) {
-                        Button {
-                            browserTarget = BrowserTarget(source: source)
-                        } label: {
-                            SourceCard(source: source, isConnected: env.connectedSourceIDs.contains(source.id))
-                        }
-                        .buttonStyle(TVCardButtonStyle())
-
-                        VStack(spacing: 12) {
-                            Button("编辑") { editingSource = source }
-                                .buttonStyle(.bordered)
-                            Button("测速") { speedTestSource = source }
-                                .buttonStyle(.bordered)
-                            Button("删除", role: .destructive) {
-                                Task { try? await env.delete(source: source) }
+                    ForEach(env.sources) { source in
+                        HStack(spacing: 20) {
+                            Button {
+                                browserTarget = BrowserTarget(source: source)
+                            } label: {
+                                SourceCard(source: source, isConnected: env.connectedSourceIDs.contains(source.id))
                             }
-                            .buttonStyle(.bordered)
+                            .buttonStyle(TVCardButtonStyle())
+
+                            VStack(spacing: 12) {
+                                Button("编辑") { editingSource = source }
+                                    .buttonStyle(.bordered)
+                                Button("测速") { speedTestSource = source }
+                                    .buttonStyle(.bordered)
+                                Button("删除", role: .destructive) {
+                                    Task { try? await env.delete(source: source) }
+                                }
+                                .buttonStyle(.bordered)
+                            }
                         }
+                        .focusSection()
                     }
                 }
+                .focusSection()
             }
             .padding(.horizontal, TVMetrics.horizontalSafeMargin)
             .padding(.vertical, TVMetrics.verticalSafeMargin)
@@ -123,7 +128,7 @@ struct SourceEditorView: View {
                     placeholder: protocolType == .smb ? "默认 445" : (useTLS ? "默认 443" : "默认 80"),
                     disableAutocorrect: true
                 )
-                field("路径 / 共享名", text: $basePath, placeholder: "留空则浏览全部共享", disableAutocorrect: true)
+                field("路径 / 共享名", text: $basePath, placeholder: "留空枚举全部共享，或填具体共享名如 /Movies", disableAutocorrect: true)
                 field("用户名", text: $username, placeholder: "留空则访客登录", disableAutocorrect: true)
                 secureField(
                     "密码",
@@ -230,9 +235,27 @@ struct SourceEditorView: View {
         }
 
         let cleanPortText = port.trimmingCharacters(in: .whitespacesAndNewlines)
+        var extractedPort: Int?
+        if cleanHost.hasPrefix("["), let closeIdx = cleanHost.firstIndex(of: "]") {
+            let inside = String(cleanHost[cleanHost.index(after: cleanHost.startIndex)..<closeIdx])
+            let after = cleanHost[cleanHost.index(after: closeIdx)...]
+            if after.hasPrefix(":"), let p = Int(after.dropFirst()), (1...65535).contains(p) {
+                extractedPort = p
+                cleanHost = inside
+            }
+        } else if cleanHost.filter({ $0 == ":" }).count == 1,
+                  let idx = cleanHost.firstIndex(of: ":") {
+            let hostPart = String(cleanHost[..<idx]).trimmingCharacters(in: .whitespacesAndNewlines)
+            let portPart = String(cleanHost[cleanHost.index(after: idx)...]).trimmingCharacters(in: .whitespacesAndNewlines)
+            if !hostPart.isEmpty, let p = Int(portPart), (1...65535).contains(p) {
+                cleanHost = hostPart
+                extractedPort = p
+            }
+        }
+
         let parsedPort: Int?
         if cleanPortText.isEmpty {
-            parsedPort = nil
+            parsedPort = extractedPort
         } else if let value = Int(cleanPortText), (1...65535).contains(value) {
             parsedPort = value
         } else {
