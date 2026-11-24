@@ -318,7 +318,7 @@ def patch_amsmb2_swift(path: pathlib.Path) -> None:
         return upper.contains("STATUS_LOGON_FAILURE") || upper.contains("0XC000006D") || upper.contains("LOGON_FAILURE")
     }
 
-    private func connect(shareName: String, encrypted: Bool) throws -> SMB2Client {
+    fileprivate func connect(shareName: String, encrypted: Bool) throws -> SMB2Client {
         let server = url.host! + (url.port.map { ":\\($0)" } ?? "")
 
         let firstClient = try SMB2Client()
@@ -363,6 +363,150 @@ def patch_amsmb2_swift(path: pathlib.Path) -> None:
         }
     }"""
     text = replace_exact(text, old_connect, new_connect, "AMSMB2.connect")
+
+    old_eof = """        try file.fsync()
+    }
+}"""
+    new_eof = """        try file.fsync()
+    }
+}
+
+/// Persistent SMB2/3 random-access file handle with its own dedicated `SMB2Client`
+/// connection so random `pread` seeks avoid per-read CREATE/CLOSE round-trips and never
+/// contend with directory browsing or another stream.
+public final class SMB2RandomAccessFile: @unchecked Sendable {
+    public let totalSize: Int64
+
+    private let lock = NSLock()
+    private let readQueue: DispatchQueue
+    private let manager: SMB2Manager
+    private let shareName: String
+    private let path: String
+    private var client: SMB2Client?
+    private var fileHandle: SMB2FileHandle?
+    private var isClosed: Bool = false
+
+    fileprivate init(manager: SMB2Manager, shareName: String, path: String) throws {
+        guard let cloned = manager.copy() as? SMB2Manager else {
+            throw POSIXError(.invalidArgument, description: "Failed to clone SMB2Manager.")
+        }
+        self.manager = cloned
+        self.shareName = shareName
+        self.path = path
+        self.readQueue = DispatchQueue(label: "amsmb2.raf.\\(UUID().uuidString)", qos: .userInitiated)
+        let c = try cloned.connect(shareName: shareName, encrypted: false)
+        let fh = try SMB2FileHandle(forReadingAtPath: path, on: c)
+        let stat = try fh.fstat()
+        self.totalSize = Int64(stat.smb2_size)
+        self.client = c
+        self.fileHandle = fh
+    }
+
+    deinit {
+        close()
+    }
+
+    public func readSync(offset: Int64, length: Int) throws -> Data {
+        lock.lock()
+        defer { lock.unlock() }
+        guard !isClosed else { throw POSIXError(.canceled, description: "SMB2RandomAccessFile closed.") }
+        guard offset >= 0, length > 0, offset < totalSize else { return Data() }
+
+        let capped = Int(min(Int64(length), totalSize - offset))
+        do {
+            return try readLocked(offset: offset, length: capped)
+        } catch {
+            guard !isClosed else { throw POSIXError(.canceled, description: "SMB2RandomAccessFile closed.") }
+            try reopenLocked()
+            return try readLocked(offset: offset, length: capped)
+        }
+    }
+
+    public func read(offset: Int64, length: Int) async throws -> Data {
+        try await withCheckedThrowingContinuation { continuation in
+            readQueue.async {
+                do {
+                    let data = try self.readSync(offset: offset, length: length)
+                    continuation.resume(returning: data)
+                } catch {
+                    continuation.resume(throwing: error)
+                }
+            }
+        }
+    }
+
+    public func close() {
+        lock.lock()
+        guard !isClosed else {
+            lock.unlock()
+            return
+        }
+        isClosed = true
+        let fh = fileHandle
+        let c = client
+        fileHandle = nil
+        client = nil
+        lock.unlock()
+
+        try? fh?.close()
+        if let c, c.isActive {
+            try? c.disconnect()
+        }
+    }
+
+    private func reopenLocked() throws {
+        let oldFH = fileHandle
+        let oldClient = client
+        fileHandle = nil
+        client = nil
+        try? oldFH?.close()
+        if let oldClient, oldClient.isActive {
+            try? oldClient.disconnect()
+        }
+        let c = try manager.connect(shareName: shareName, encrypted: false)
+        let fh = try SMB2FileHandle(forReadingAtPath: path, on: c)
+        self.client = c
+        self.fileHandle = fh
+    }
+
+    private func readLocked(offset: Int64, length: Int) throws -> Data {
+        guard let fh = fileHandle else {
+            throw POSIXError(.socketNotConnected, description: "SMB2 file handle unavailable.")
+        }
+        let maxChunk = max(64 * 1024, fh.optimizedReadSize)
+        if length <= maxChunk {
+            return try fh.read(toAbsoluteOffset: UInt64(offset), length: length)
+        }
+        var buffer = Data()
+        buffer.reserveCapacity(length)
+        var cursor = offset
+        let end = offset + Int64(length)
+        while cursor < end {
+            let step = Int(min(Int64(maxChunk), end - cursor))
+            let part = try fh.read(toAbsoluteOffset: UInt64(cursor), length: step)
+            if part.isEmpty { break }
+            buffer.append(part)
+            cursor += Int64(part.count)
+        }
+        return buffer
+    }
+}
+
+extension SMB2Manager {
+    open func openRandomAccessFile(shareName: String, atPath path: String) async throws -> SMB2RandomAccessFile {
+        try await withCheckedThrowingContinuation { continuation in
+            q.async {
+                do {
+                    let file = try SMB2RandomAccessFile(manager: self, shareName: shareName, path: path)
+                    continuation.resume(returning: file)
+                } catch {
+                    continuation.resume(throwing: error)
+                }
+            }
+        }
+    }
+}"""
+    text = replace_exact(text, old_eof, new_eof, "AMSMB2.SMB2RandomAccessFile")
 
     path.write_text(text, encoding="utf-8")
 

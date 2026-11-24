@@ -15,18 +15,18 @@ public enum ShortPressSeekBehavior: String, CaseIterable, Codable, Sendable {
 
 /// Long-press MX Player speed curve presets.
 public enum LongPressSpeedProfile: String, CaseIterable, Codable, Sendable {
-    /// 精细模式：10x -> 24x -> 48x -> 96x
+    /// 精细平滑加速：4x 起步连续平滑提速至 60x 上限
     case gentle
-    /// MX 标准（默认，比苹果原版更快更顺手）：18x -> 45x -> 90x -> 180x
+    /// 标准丝滑加速（默认）：6x 起步连续平滑提速至 120x 上限
     case mxStandard
-    /// 极速扫片：30x -> 75x -> 150x -> 300x
+    /// 极速扫片：10x 起步连续平滑提速至 240x 上限
     case turbo
 
     public var displayName: String {
         switch self {
-        case .gentle:     return "精细 (10x~96x)"
-        case .mxStandard: return "MX 标准 (18x~180x)"
-        case .turbo:      return "极速 (30x~300x)"
+        case .gentle:     return "精细 (4x→60x)"
+        case .mxStandard: return "标准丝滑 (6x→120x)"
+        case .turbo:      return "极速 (10x→240x)"
         }
     }
 }

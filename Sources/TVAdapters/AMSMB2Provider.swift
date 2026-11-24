@@ -418,15 +418,28 @@ public final class AMSMB2Provider: VFSProvider, @unchecked Sendable {
             throw VFSError.notFound(path)
         }
         try await ensureShareConnected(resolved.share, using: manager)
-        let attributes = try await manager.attributesOfItem(atPath: resolved.relativePath)
-        let size = (attributes[.fileSizeKey] as? Int64) ?? 0
-        return AMSMB2RandomAccessStream(
-            provider: self,
-            manager: manager,
-            share: resolved.share,
-            path: resolved.relativePath,
-            totalSize: size
-        )
+        do {
+            let file = try await manager.openRandomAccessFile(shareName: resolved.share, atPath: resolved.relativePath)
+            return AMSMB2RandomAccessStream(file: file)
+        } catch {
+            throw Self.classifySMBError(error, share: resolved.share)
+        }
+    }
+
+    /// Opens a dedicated persistent SMB file handle for synchronous FFmpeg AVIO scrubbing
+    /// without loopback HTTP/TCP overhead or main playback stream lock contention.
+    public func openSynchronousScrubReader(at path: String) async throws -> any SynchronousRandomAccessReader {
+        let manager = try currentManager()
+        guard let resolved = resolveShareAndRelativePath(path) else {
+            throw VFSError.notFound(path)
+        }
+        try await ensureShareConnected(resolved.share, using: manager)
+        do {
+            let file = try await manager.openRandomAccessFile(shareName: resolved.share, atPath: resolved.relativePath)
+            return SMB2SynchronousReader(file: file)
+        } catch {
+            throw Self.classifySMBError(error, share: resolved.share)
+        }
     }
 
     public func readFileData(at path: String, maxBytes: Int) async throws -> Data {
@@ -483,21 +496,39 @@ public final class AMSMB2Provider: VFSProvider, @unchecked Sendable {
     }
 }
 
-/// Random-access stream over an AMSMB2 share.
+/// Synchronous random-access reader contract used by direct FFmpeg AVIO scrubbing.
+public protocol SynchronousRandomAccessReader: Sendable {
+    var totalSize: Int64 { get }
+    func readSync(offset: Int64, length: Int) throws -> Data
+    func closeSync()
+}
+
+/// Persistent SMB2 synchronous reader backed by a dedicated `SMB2RandomAccessFile`.
+public final class SMB2SynchronousReader: SynchronousRandomAccessReader, @unchecked Sendable {
+    private let file: SMB2RandomAccessFile
+    public var totalSize: Int64 { file.totalSize }
+
+    public init(file: SMB2RandomAccessFile) {
+        self.file = file
+    }
+
+    public func readSync(offset: Int64, length: Int) throws -> Data {
+        try file.readSync(offset: offset, length: length)
+    }
+
+    public func closeSync() {
+        file.close()
+    }
+}
+
+/// Persistent random-access stream backed by a single open `SMB2RandomAccessFile`.
 public final class AMSMB2RandomAccessStream: VFSRandomAccessStream, @unchecked Sendable {
-    public let totalSize: Int64
-    private let provider: AMSMB2Provider
-    private let manager: SMB2Manager
-    private let share: String
-    private let path: String
+    public var totalSize: Int64 { file.totalSize }
+    private let file: SMB2RandomAccessFile
     private let closed = ManagedAtomicFlag()
 
-    init(provider: AMSMB2Provider, manager: SMB2Manager, share: String, path: String, totalSize: Int64) {
-        self.provider = provider
-        self.manager = manager
-        self.share = share
-        self.path = path
-        self.totalSize = totalSize
+    init(file: SMB2RandomAccessFile) {
+        self.file = file
     }
 
     public func read(offset: Int64, length: Int) async throws -> Data {
@@ -505,20 +536,22 @@ public final class AMSMB2RandomAccessStream: VFSRandomAccessStream, @unchecked S
         guard offset >= 0, length >= 0 else {
             throw VFSError.invalidRange(offset: offset, length: length, totalSize: totalSize)
         }
-        guard offset < totalSize else { return Data() }
+        guard offset < totalSize, length > 0 else { return Data() }
         let capped = Int(min(Int64(length), totalSize - offset))
         try Task.checkCancellation()
-        return try await provider.readWithReconnect(
-            manager: manager,
-            share: share,
-            path: path,
-            offset: offset,
-            length: capped
-        )
+        do {
+            return try await file.read(offset: offset, length: capped)
+        } catch is CancellationError {
+            throw VFSError.cancelled
+        } catch {
+            if closed.isSet { throw VFSError.cancelled }
+            throw VFSError.ioFailure("SMB read(\(offset)+\(capped)) failed: \(error.localizedDescription)")
+        }
     }
 
     public func close() async {
         closed.set()
+        file.close()
     }
 }
 

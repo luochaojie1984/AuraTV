@@ -50,7 +50,7 @@ public final class MXScrubController: ObservableObject {
     private var pendingPreviewTarget: TimeInterval?
     private var lastDecodedRequestTarget: TimeInterval = -.infinity
     private var commitEpoch: UInt64 = 0
-    private let tickIntervalNs: UInt64 = 66_000_000 // ~15 Hz ultra-smooth target clock
+    private let tickIntervalNs: UInt64 = 33_000_000 // ~30 Hz silky target clock
 
     public init() {}
 
@@ -76,30 +76,16 @@ public final class MXScrubController: ObservableObject {
         }
     }
 
-    /// 参照 MX Player 的三档长按非线性加速曲线（比苹果原版更快更顺手）
+    /// 连续指数平滑加速曲线（无顿挫档位跳变，按住越久越快并带平滑速度上限）
     private func holdSpeedMultiplier(elapsedHold: TimeInterval, profile: LongPressSpeedProfile) -> Double {
+        let t = max(0, elapsedHold)
         switch profile {
         case .gentle:
-            switch elapsedHold {
-            case ..<0.8: return 10.0
-            case ..<2.0: return 24.0
-            case ..<3.5: return 48.0
-            default:     return 96.0
-            }
+            return min(60.0, 4.0 * pow(2.15, t))
         case .mxStandard:
-            switch elapsedHold {
-            case ..<0.7: return 18.0   // 立刻有感快进，比原版更利落
-            case ..<1.8: return 45.0   // 流畅巡航
-            case ..<3.2: return 90.0   // 每按 1 秒扫过 1.5 分钟
-            default:     return 180.0  // 每按 1 秒扫过 3 分钟，2 小时电影几十秒扫完
-            }
+            return min(120.0, 6.0 * pow(2.25, t))
         case .turbo:
-            switch elapsedHold {
-            case ..<0.6: return 30.0
-            case ..<1.6: return 75.0
-            case ..<3.0: return 150.0
-            default:     return 300.0
-            }
+            return min(240.0, 10.0 * pow(2.40, t))
         }
     }
 
@@ -208,19 +194,30 @@ public final class MXScrubController: ObservableObject {
             currentDuration = duration
         }
 
-        pressStartTime = Date()
-        let initialSpeed = Int(holdSpeedMultiplier(elapsedHold: 0, profile: speedProfile))
-        activeMode = .hold(direction: direction, speedMultiplier: initialSpeed)
+        let start = Date()
+        pressStartTime = start
+        let initialSpeed = holdSpeedMultiplier(elapsedHold: 0, profile: speedProfile)
+        activeMode = .hold(direction: direction, speedMultiplier: max(1, Int(initialSpeed.rounded())))
         isShowingBar = true
+
+        // Immediately advance the first micro-step so frame 1 starts decoding right away.
+        let baseDt = Double(tickIntervalNs) / 1_000_000_000.0
+        targetTime = clampTime(targetTime + initialSpeed * baseDt * Double(direction.rawValue), duration: duration)
+        deltaSeconds = targetTime - anchorTime
+        pendingPreviewTarget = targetTime
 
         tickTask?.cancel()
         tickTask = Task { [weak self] in
             guard let self else { return }
-            let dt = Double(self.tickIntervalNs) / 1_000_000_000.0
+            var lastTick = start
+            try? await Task.sleep(nanoseconds: self.tickIntervalNs)
             while !Task.isCancelled && self.isScrubbing {
-                let elapsed = Date().timeIntervalSince(self.pressStartTime ?? Date())
+                let now = Date()
+                let dt = min(0.08, max(0.01, now.timeIntervalSince(lastTick)))
+                lastTick = now
+                let elapsed = now.timeIntervalSince(self.pressStartTime ?? now)
                 let speed = self.holdSpeedMultiplier(elapsedHold: elapsed, profile: speedProfile)
-                self.activeMode = .hold(direction: direction, speedMultiplier: Int(speed))
+                self.activeMode = .hold(direction: direction, speedMultiplier: max(1, Int(speed.rounded())))
                 let step = speed * dt * Double(direction.rawValue)
                 let next = self.clampTime(self.targetTime + step, duration: self.currentDuration)
                 if next != self.targetTime || self.pendingPreviewTarget == nil {
@@ -377,8 +374,8 @@ public final class MXScrubController: ObservableObject {
             while !Task.isCancelled && self.isScrubbing {
                 if let nextTarget = self.pendingPreviewTarget {
                     self.pendingPreviewTarget = nil
-                    if abs(nextTarget - self.lastDecodedRequestTarget) < 0.2 && self.framePresenter.isVisible {
-                        try? await Task.sleep(nanoseconds: 12_000_000)
+                    if abs(nextTarget - self.lastDecodedRequestTarget) < 0.05 && self.framePresenter.isVisible {
+                        try? await Task.sleep(nanoseconds: 4_000_000)
                         continue
                     }
                     self.lastDecodedRequestTarget = nextTarget
@@ -395,7 +392,7 @@ public final class MXScrubController: ObservableObject {
                         self.displayedFrameTime = nextTarget
                     }
                 } else {
-                    try? await Task.sleep(nanoseconds: 12_000_000)
+                    try? await Task.sleep(nanoseconds: 4_000_000)
                 }
             }
         }

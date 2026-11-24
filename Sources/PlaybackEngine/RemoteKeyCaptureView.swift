@@ -87,7 +87,7 @@ public struct RemoteKeyCaptureView: UIViewControllerRepresentable {
         private var holdTimer: Timer?
         private var activeDirection: ScrubDirection?
         private var didTriggerLongPress: Bool = false
-        private let longPressThreshold: TimeInterval = 0.22 // 220ms 判定为长按
+        private let longPressThreshold: TimeInterval = 0.18 // 180ms 灵敏判定为长按
 
         // Siri Remote touchpad pan scrub state
         private var panGesture: UIPanGestureRecognizer?

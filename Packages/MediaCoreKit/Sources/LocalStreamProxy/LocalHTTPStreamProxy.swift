@@ -46,6 +46,7 @@ public final class LocalHTTPStreamProxy: @unchecked Sendable {
     private var isRunning: Bool = false
     private var streams: [String: RegisteredStreamEntry] = [:]
     private var scrubTokens: Set<String> = []
+    private var activeScrubTasks: [String: [UUID: Task<Void, Never>]] = [:]
 
     public init() {}
 
@@ -125,11 +126,16 @@ public final class LocalHTTPStreamProxy: @unchecked Sendable {
         listenFD = -1
         isRunning = false
         let existingStreams = streams
+        let scrubTasksToCancel = activeScrubTasks.values.flatMap(\.values)
         streams.removeAll()
         scrubTokens.removeAll()
+        activeScrubTasks.removeAll()
         port = 0
         lock.unlock()
 
+        for task in scrubTasksToCancel {
+            task.cancel()
+        }
         if wasRunning && fd >= 0 {
             shutdown(fd, Int32(SHUT_RDWR))
             close(fd)
@@ -182,13 +188,19 @@ public final class LocalHTTPStreamProxy: @unchecked Sendable {
     /// keyframe reads fetch exact small slices (~128-256KB) instead of 2MB chunks.
     public func setScrubMode(_ enabled: Bool, for token: String) {
         lock.lock()
+        let tasksToCancel: [Task<Void, Never>]
         if enabled {
             scrubTokens.insert(token)
+            tasksToCancel = []
         } else {
             scrubTokens.remove(token)
+            tasksToCancel = activeScrubTasks.removeValue(forKey: token).map { Array($0.values) } ?? []
         }
         let entry = streams[token]
         lock.unlock()
+        for task in tasksToCancel {
+            task.cancel()
+        }
         if let cache = entry?.stream as? ReadAheadStreamCache {
             Task {
                 await cache.setScrubBypass(enabled)
@@ -206,10 +218,35 @@ public final class LocalHTTPStreamProxy: @unchecked Sendable {
         lock.lock()
         let removed = streams.removeValue(forKey: token)
         scrubTokens.remove(token)
+        let tasksToCancel = activeScrubTasks.removeValue(forKey: token).map { Array($0.values) } ?? []
         lock.unlock()
+        for task in tasksToCancel {
+            task.cancel()
+        }
         if let removed {
             Task { await removed.stream.close() }
         }
+    }
+
+    private func registerScrubTask(_ task: Task<Void, Never>, id: UUID, for token: String) {
+        lock.lock()
+        var map = activeScrubTasks[token] ?? [:]
+        map[id] = task
+        activeScrubTasks[token] = map
+        lock.unlock()
+    }
+
+    private func removeScrubTask(id: UUID, for token: String) {
+        lock.lock()
+        if var map = activeScrubTasks[token] {
+            map.removeValue(forKey: id)
+            if map.isEmpty {
+                activeScrubTasks.removeValue(forKey: token)
+            } else {
+                activeScrubTasks[token] = map
+            }
+        }
+        lock.unlock()
     }
 
     private func lookupStream(token: String) -> RegisteredStreamEntry? {
@@ -324,25 +361,44 @@ public final class LocalHTTPStreamProxy: @unchecked Sendable {
         )
         guard sendAll(fd: fd, data: headerData) else { return }
 
-        // Stream requested byte range in 128 KB slices during MX live scrub (minimal latency)
-        // or 256 KB slices during normal sequential playback; abort cleanly if client disconnects.
-        var cursor = byteRange.lowerBound
-        while cursor <= byteRange.upperBound {
-            if Task.isCancelled || !checkRunning() { break }
-            let sliceSize = isScrubMode(token: tokenKey) ? (128 * 1024) : (256 * 1024)
-            let remaining = byteRange.upperBound - cursor + 1
-            let toRead = Int(min(Int64(sliceSize), remaining))
-            do {
-                let chunk = try await entry.stream.read(offset: cursor, length: toRead)
-                if chunk.isEmpty { break }
-                if !sendAll(fd: fd, data: chunk) {
-                    // Client closed socket (e.g. MX live scrub seek aborted old request)
+        let scrubMode = isScrubMode(token: tokenKey)
+        if scrubMode {
+            // Bound kernel send buffer during transient scrub sockets so aborted requests
+            // never pull megabytes of wasted read-ahead bytes over SMB.
+            var sndBuf: Int32 = 65536
+            _ = setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &sndBuf, socklen_t(MemoryLayout<Int32>.size))
+        }
+
+        // Stream requested byte range in compact 64 KB slices during MX live scrub
+        // or 256 KB slices during normal sequential playback; abort cleanly on disconnect.
+        let streamTask = Task {
+            var cursor = byteRange.lowerBound
+            while cursor <= byteRange.upperBound {
+                if Task.isCancelled || !checkRunning() { break }
+                let sliceSize = isScrubMode(token: tokenKey) ? (64 * 1024) : (256 * 1024)
+                let remaining = byteRange.upperBound - cursor + 1
+                let toRead = Int(min(Int64(sliceSize), remaining))
+                do {
+                    let chunk = try await entry.stream.read(offset: cursor, length: toRead)
+                    if chunk.isEmpty { break }
+                    if !sendAll(fd: fd, data: chunk) {
+                        // Client closed socket (e.g. scrub seek aborted old request)
+                        break
+                    }
+                    cursor += Int64(chunk.count)
+                } catch {
                     break
                 }
-                cursor += Int64(chunk.count)
-            } catch {
-                break
             }
+        }
+
+        let scrubTaskID = UUID()
+        if scrubMode {
+            registerScrubTask(streamTask, id: scrubTaskID, for: tokenKey)
+        }
+        await streamTask.value
+        if scrubMode {
+            removeScrubTask(id: scrubTaskID, for: tokenKey)
         }
     }
 

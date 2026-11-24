@@ -559,9 +559,12 @@ struct PlayerScreenView: View {
 
             let localScrub = scrubEngine
             let streamURL = registered.url
+            let smbProvider = provider as? AMSMB2Provider
+            let itemPath = item.path
             scrubPrepareTask?.cancel()
-            scrubPrepareTask = Task.detached(priority: .utility) {
-                await localScrub.prepare(url: streamURL)
+            scrubPrepareTask = Task.detached(priority: .userInitiated) {
+                let directReader = try? await smbProvider?.openSynchronousScrubReader(at: itemPath)
+                await localScrub.prepare(url: streamURL, directReader: directReader)
             }
             scheduleHUDHide()
             await loadSubtitles(provider: provider, for: item)
