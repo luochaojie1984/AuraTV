@@ -55,12 +55,42 @@ public final class LocalHTTPStreamProxy: @unchecked Sendable {
     }
 
     public func start() throws {
+        try ensureRunning(forceRestart: false)
+    }
+
+    /// Ensures the loopback HTTP Range listener is actively bound and accepting connections.
+    /// Automatically recovers when tvOS revokes the listening socket in background.
+    public func ensureRunning(forceRestart: Bool = false) throws {
         lock.lock()
-        if isRunning {
-            lock.unlock()
+        let running = isRunning
+        let currentFD = listenFD
+        let currentPort = port
+        lock.unlock()
+
+        if !forceRestart && running && isListenerAlive(fd: currentFD, port: currentPort) {
             return
         }
 
+        let (newFD, newPort) = try createBoundListener()
+
+        lock.lock()
+        let oldFD = self.listenFD
+        self.listenFD = newFD
+        self.port = newPort
+        self.isRunning = true
+        lock.unlock()
+
+        if oldFD >= 0 {
+            shutdown(oldFD, Int32(SHUT_RDWR))
+            close(oldFD)
+        }
+
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            self?.acceptLoop(listenFD: newFD)
+        }
+    }
+
+    private func createBoundListener() throws -> (fd: Int32, port: UInt16) {
         #if canImport(Glibc)
         let sockType = Int32(SOCK_STREAM.rawValue)
         #else
@@ -69,13 +99,15 @@ public final class LocalHTTPStreamProxy: @unchecked Sendable {
 
         let fd = socket(AF_INET, sockType, 0)
         if fd < 0 {
-            let err = errno
-            lock.unlock()
-            throw LocalStreamProxyError.socketCreationFailed(err)
+            throw LocalStreamProxyError.socketCreationFailed(errno)
         }
 
         var reuse: Int32 = 1
         setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &reuse, socklen_t(MemoryLayout<Int32>.size))
+        #if canImport(Darwin)
+        var noSigPipe: Int32 = 1
+        setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &noSigPipe, socklen_t(MemoryLayout<Int32>.size))
+        #endif
 
         var addr = sockaddr_in()
         addr.sin_family = sa_family_t(AF_INET)
@@ -90,14 +122,12 @@ public final class LocalHTTPStreamProxy: @unchecked Sendable {
         if bindRes != 0 {
             let err = errno
             close(fd)
-            lock.unlock()
             throw LocalStreamProxyError.bindFailed(err)
         }
 
         if listen(fd, 32) != 0 {
             let err = errno
             close(fd)
-            lock.unlock()
             throw LocalStreamProxyError.listenFailed(err)
         }
 
@@ -108,15 +138,72 @@ public final class LocalHTTPStreamProxy: @unchecked Sendable {
                 getsockname(fd, $0, &addrLen)
             }
         }
+        return (fd, UInt16(bigEndian: boundAddr.sin_port))
+    }
 
-        self.listenFD = fd
-        self.port = UInt16(bigEndian: boundAddr.sin_port)
-        self.isRunning = true
-        lock.unlock()
+    private func isListenerAlive(fd: Int32, port: UInt16) -> Bool {
+        guard fd >= 0, port > 0 else { return false }
 
-        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-            self?.acceptLoop(listenFD: fd)
+        var boundAddr = sockaddr_in()
+        var addrLen = socklen_t(MemoryLayout<sockaddr_in>.size)
+        let nameRes = withUnsafeMutablePointer(to: &boundAddr) {
+            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                getsockname(fd, $0, &addrLen)
+            }
         }
+        guard nameRes == 0, UInt16(bigEndian: boundAddr.sin_port) == port else {
+            return false
+        }
+
+        #if canImport(Glibc)
+        let sockType = Int32(SOCK_STREAM.rawValue)
+        #else
+        let sockType = SOCK_STREAM
+        #endif
+
+        let probeFD = socket(AF_INET, sockType, 0)
+        guard probeFD >= 0 else { return false }
+        defer { close(probeFD) }
+
+        #if canImport(Darwin)
+        var noSigPipe: Int32 = 1
+        setsockopt(probeFD, SOL_SOCKET, SO_NOSIGPIPE, &noSigPipe, socklen_t(MemoryLayout<Int32>.size))
+        #endif
+
+        let flags = fcntl(probeFD, F_GETFL, 0)
+        if flags >= 0 {
+            _ = fcntl(probeFD, F_SETFL, flags | O_NONBLOCK)
+        }
+
+        var target = sockaddr_in()
+        target.sin_family = sa_family_t(AF_INET)
+        target.sin_port = port.bigEndian
+        target.sin_addr.s_addr = inet_addr("127.0.0.1")
+
+        let connRes = withUnsafePointer(to: &target) {
+            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                connect(probeFD, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
+            }
+        }
+        if connRes == 0 {
+            return true
+        }
+        guard errno == EINPROGRESS else {
+            return false
+        }
+
+        var pfd = pollfd(fd: probeFD, events: Int16(POLLOUT), revents: 0)
+        let pollRes = poll(&pfd, 1, 150)
+        guard pollRes > 0 else {
+            return false
+        }
+
+        var soErr: Int32 = 0
+        var soErrLen = socklen_t(MemoryLayout<Int32>.size)
+        guard getsockopt(probeFD, SOL_SOCKET, SO_ERROR, &soErr, &soErrLen) == 0 else {
+            return false
+        }
+        return soErr == 0
     }
 
     public func stop() {
@@ -261,8 +348,14 @@ public final class LocalHTTPStreamProxy: @unchecked Sendable {
         return isRunning
     }
 
+    private func isCurrentListener(_ fd: Int32) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return isRunning && listenFD == fd
+    }
+
     private func acceptLoop(listenFD: Int32) {
-        while checkRunning() {
+        while isCurrentListener(listenFD) {
             var clientAddr = sockaddr_in()
             var addrLen = socklen_t(MemoryLayout<sockaddr_in>.size)
             let clientFD = withUnsafeMutablePointer(to: &clientAddr) {
@@ -271,8 +364,22 @@ public final class LocalHTTPStreamProxy: @unchecked Sendable {
                 }
             }
             if clientFD < 0 {
-                if !checkRunning() { break }
-                continue
+                let err = errno
+                if !isCurrentListener(listenFD) { break }
+                if err == EINTR { continue }
+                if err == EAGAIN || err == EWOULDBLOCK {
+                    usleep(10_000)
+                    continue
+                }
+                lock.lock()
+                if self.listenFD == listenFD {
+                    self.isRunning = false
+                    self.listenFD = -1
+                    self.port = 0
+                }
+                lock.unlock()
+                close(listenFD)
+                break
             }
 
             #if canImport(Darwin)

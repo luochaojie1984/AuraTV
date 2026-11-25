@@ -5,6 +5,8 @@ import LocalStreamProxy
 @main
 struct AuraTVApp: App {
     @StateObject private var env = AppEnvironment.shared
+    @Environment(\.scenePhase) private var scenePhase
+    @State private var wasInBackground = false
 
     var body: some Scene {
         WindowGroup {
@@ -12,6 +14,19 @@ struct AuraTVApp: App {
                 .environmentObject(env)
                 .preferredColorScheme(.dark)
                 .task { await env.bootstrap() }
+                .onChange(of: scenePhase) { _, newPhase in
+                    switch newPhase {
+                    case .background:
+                        wasInBackground = true
+                    case .active:
+                        if wasInBackground {
+                            wasInBackground = false
+                            Task { await env.handleReturnToForeground() }
+                        }
+                    default:
+                        break
+                    }
+                }
         }
     }
 }

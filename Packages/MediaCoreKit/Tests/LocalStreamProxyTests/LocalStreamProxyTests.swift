@@ -115,4 +115,50 @@ final class LocalStreamProxyTests: XCTestCase {
         let (_, resp) = try await fetchSync(URLRequest(url: badURL))
         XCTAssertEqual(resp.statusCode, 404)
     }
+
+    func testEnsureRunningRecoversAfterStopAndForceRestart() async throws {
+        let proxy = LocalHTTPStreamProxy()
+        try proxy.start()
+        defer { proxy.stop() }
+
+        let initialPort = proxy.port
+        XCTAssertGreaterThan(initialPort, 0)
+
+        let source1 = InMemoryVideoStream(sizeBytes: 128_000)
+        let (tok1, url1) = try proxy.register(stream: source1, fileName: "sample1.mkv")
+        let (d1, r1) = try await fetchSync(URLRequest(url: url1))
+        XCTAssertEqual(r1.statusCode, 200)
+        XCTAssertEqual(d1, source1.data)
+
+        // Alive listener should be kept untouched when forceRestart is false.
+        try proxy.ensureRunning(forceRestart: false)
+        XCTAssertEqual(proxy.port, initialPort)
+        let (_, r1Again) = try await fetchSync(URLRequest(url: url1))
+        XCTAssertEqual(r1Again.statusCode, 200)
+        proxy.unregister(token: tok1)
+
+        // Force restart should bind a live socket and serve Range requests cleanly.
+        try proxy.ensureRunning(forceRestart: true)
+        XCTAssertGreaterThan(proxy.port, 0)
+        let source2 = InMemoryVideoStream(sizeBytes: 128_000)
+        let (tok2, url2) = try proxy.register(stream: source2, fileName: "sample2.mkv")
+        var rangeReq = URLRequest(url: url2)
+        rangeReq.setValue("bytes=1024-2047", forHTTPHeaderField: "Range")
+        let (d2, r2) = try await fetchSync(rangeReq)
+        XCTAssertEqual(r2.statusCode, 206)
+        XCTAssertEqual(d2, Data(source2.data[1024...2047]))
+        proxy.unregister(token: tok2)
+
+        // Recovery from completely stopped state.
+        proxy.stop()
+        XCTAssertEqual(proxy.port, 0)
+        try proxy.ensureRunning()
+        XCTAssertGreaterThan(proxy.port, 0)
+        let source3 = InMemoryVideoStream(sizeBytes: 64_000)
+        let (tok3, url3) = try proxy.register(stream: source3, fileName: "sample3.mp4")
+        let (d3, r3) = try await fetchSync(URLRequest(url: url3))
+        XCTAssertEqual(r3.statusCode, 200)
+        XCTAssertEqual(d3, source3.data)
+        proxy.unregister(token: tok3)
+    }
 }

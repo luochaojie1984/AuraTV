@@ -1,5 +1,6 @@
 import SwiftUI
 import UIKit
+import QuartzCore
 import AVFoundation
 import NetworkVFS
 import SubtitleKit
@@ -35,6 +36,7 @@ struct PlayerScreenView: View {
 
     @EnvironmentObject private var env: AppEnvironment
     @Environment(\.dismiss) private var dismiss
+    @Environment(\.scenePhase) private var scenePhase
 
     @StateObject private var engine = PlaybackCoordinator()
     @StateObject private var scrub = MXScrubController()
@@ -67,6 +69,12 @@ struct PlayerScreenView: View {
     @State private var noticeTask: Task<Void, Never>?
     @State private var lastReportedSecond: Int = -1
     @State private var didShutdown: Bool = false
+    @State private var needsForegroundRecovery: Bool = false
+    @State private var isRecoveringForeground: Bool = false
+    @State private var resumePositionAfterBackground: TimeInterval = 0
+    @State private var fastPlayAnchorTime: TimeInterval = 0
+    @State private var fastPlayStartWallTime: CFTimeInterval = 0
+    @State private var fastPlayMeasuredRate: Double = 3.0
 
     init(request: PlaybackRequest) {
         self.request = request
@@ -380,8 +388,15 @@ struct PlayerScreenView: View {
                         .font(.system(size: 18))
                         .foregroundStyle(TVTheme.secondaryText)
                         .multilineTextAlignment(.center)
-                    Button("返回") { shutdown() }
+                    HStack(spacing: 24) {
+                        Button("重试播放") {
+                            Task { await recoverAfterForeground() }
+                        }
                         .buttonStyle(.borderedProminent)
+
+                        Button("返回") { shutdown() }
+                            .buttonStyle(.bordered)
+                    }
                 }
                 .padding(44)
                 .tvGlassSurface(cornerRadius: 24)
@@ -395,6 +410,46 @@ struct PlayerScreenView: View {
         }
         .onChange(of: engine.currentTime) { _, newValue in
             persistProgress(newValue)
+            if isFastPlaying {
+                let wallElapsed = CACurrentMediaTime() - fastPlayStartWallTime
+                if wallElapsed >= 0.35 {
+                    let measured = (newValue - fastPlayAnchorTime) / wallElapsed
+                    if measured.isFinite && measured > 0 {
+                        fastPlayMeasuredRate = fastPlayMeasuredRate * 0.6 + min(8.0, measured) * 0.4
+                    }
+                }
+            }
+        }
+        .onChange(of: scenePhase) { _, newPhase in
+            guard !didShutdown else { return }
+            switch newPhase {
+            case .background:
+                let currentPos = scrub.isScrubbing ? scrub.synchronizedDisplayTime : engine.currentTime
+                if currentPos > 0 {
+                    resumePositionAfterBackground = currentPos
+                }
+                if isFastPlaying {
+                    isFastPlaying = false
+                    engine.setMuted(false)
+                    engine.setPlaybackRate(1.0)
+                }
+                scrub.cancelAll()
+                engine.pause()
+                persistProgress(resumePositionAfterBackground, force: true)
+                needsForegroundRecovery = true
+            case .active:
+                if needsForegroundRecovery && !isRecoveringForeground {
+                    needsForegroundRecovery = false
+                    Task { await recoverAfterForeground() }
+                }
+            default:
+                break
+            }
+        }
+        .onReceive(NotificationCenter.default.publisher(for: AppEnvironment.appDidReturnToForegroundNotification)) { _ in
+            guard !didShutdown, needsForegroundRecovery, !isRecoveringForeground else { return }
+            needsForegroundRecovery = false
+            Task { await recoverAfterForeground() }
         }
         .onChange(of: engine.isPlaying) { _, _ in
             updateIdleTimer()
@@ -462,15 +517,20 @@ struct PlayerScreenView: View {
         let barOpacity = env.settings.scrubBarOpacity
         let barHeight = CGFloat(env.settings.scrubBarHeight)
         let timeOpacity = env.settings.scrubTimeTextOpacity
-        let displayTime = isFastPlaying ? engine.currentTime : scrub.targetTime
+        let displayTime = isFastPlaying ? engine.currentTime : scrub.synchronizedDisplayTime
+        let deltaSec = isFastPlaying ? (engine.currentTime - fastPlayAnchorTime) : scrub.synchronizedDeltaSeconds
         let ratio = engine.duration > 0 ? min(max(displayTime / engine.duration, 0), 1) : 0
 
         let leftLabel: String = {
+            let sign = deltaSec >= 0 ? "+" : "-"
+            let delta = formatTime(abs(deltaSec))
             if isFastPlaying {
-                return fastPlayDirection == .forward ? ">>> 3.0x" : "<<<"
+                let rounded = fastPlayMeasuredRate.rounded()
+                let rateText = abs(fastPlayMeasuredRate - rounded) <= 0.18
+                    ? "\(max(1, Int(rounded)))x"
+                    : String(format: "%.1fx", max(0.5, fastPlayMeasuredRate))
+                return (fastPlayDirection == .forward ? ">>> \(rateText)" : "<<< -\(rateText)") + "  \(sign)\(delta)"
             }
-            let sign = scrub.deltaSeconds >= 0 ? "+" : "-"
-            let delta = formatTime(abs(scrub.deltaSeconds))
             let badge = scrub.speedLabel
             return badge.isEmpty ? "\(sign)\(delta)" : "\(badge)  \(sign)\(delta)"
         }()
@@ -506,58 +566,117 @@ struct PlayerScreenView: View {
         }
     }
 
+    private func recoverAfterForeground() async {
+        guard !isRecoveringForeground, !didShutdown else { return }
+        isRecoveringForeground = true
+        defer { isRecoveringForeground = false }
+
+        scrubPrepareTask?.cancel()
+        scrubPrepareTask = nil
+        scrub.cancelAll()
+        if let token = activeStreamToken {
+            env.proxy.setScrubMode(false, for: token)
+            env.proxy.unregister(token: token)
+            activeStreamToken = nil
+        }
+        await scrubEngine.close()
+        scrubEngine = LiveKeyframeScrubEngine()
+        engine.shutdown()
+
+        try? env.proxy.ensureRunning(forceRestart: true)
+        await env.invalidateCachedProvider(for: request.source.id)
+
+        let resumeAt = resumePositionAfterBackground > 0
+            ? resumePositionAfterBackground
+            : (engine.currentTime > 0 ? engine.currentTime : request.resumeAt)
+        await startPlayback(item: currentItem, startAt: resumeAt)
+    }
+
     private func startPlayback(item: VFSFileItem, startAt: TimeInterval) async {
         isLoadingMedia = true
         loadError = nil
         updateIdleTimer()
 
-        do {
-            let provider: any VFSProvider
-            let stream: any VFSRandomAccessStream
-            do {
-                let p = try await env.connectedProvider(for: request.source)
-                stream = try await p.openStream(at: item.path)
-                provider = p
-            } catch {
-                let p = try await env.connectedProvider(for: request.source, forceReconnect: true)
-                stream = try await p.openStream(at: item.path)
-                provider = p
-            }
-            self.activeProvider = provider
+        let effectiveStartAt = env.settings.enableResumePlayback ? startAt : 0
 
-            let maxCacheBytes = env.settings.readAheadCacheLimitMB * 1024 * 1024
-            let edgeBytes = min(16 * 1024 * 1024, max(4 * 1024 * 1024, maxCacheBytes / 4))
-            let cacheConfig = StreamCacheConfiguration(
-                maxCacheBytes: maxCacheBytes,
-                protectedEdgeBytes: edgeBytes
-            )
-            let registered = try env.proxy.register(
-                stream: stream,
-                fileName: item.name,
-                wrapWithReadAheadCache: true,
-                cacheConfig: cacheConfig
-            )
-            self.activeStreamToken = registered.token
-            self.activeStreamURL = registered.url
+        do {
+            var openedProvider: (any VFSProvider)?
+            var openedURL: URL?
+
+            for attempt in 1...2 {
+                guard !didShutdown else { return }
+                try env.proxy.ensureRunning(forceRestart: attempt > 1)
+
+                let provider: any VFSProvider
+                let stream: any VFSRandomAccessStream
+                do {
+                    let p = try await env.connectedProvider(for: request.source, forceReconnect: attempt > 1)
+                    stream = try await p.openStream(at: item.path)
+                    provider = p
+                } catch {
+                    let p = try await env.connectedProvider(for: request.source, forceReconnect: true)
+                    stream = try await p.openStream(at: item.path)
+                    provider = p
+                }
+                self.activeProvider = provider
+
+                let maxCacheBytes = env.settings.readAheadCacheLimitMB * 1024 * 1024
+                let edgeBytes = min(16 * 1024 * 1024, max(4 * 1024 * 1024, maxCacheBytes / 4))
+                let cacheConfig = StreamCacheConfiguration(
+                    maxCacheBytes: maxCacheBytes,
+                    protectedEdgeBytes: edgeBytes
+                )
+                let registered = try env.proxy.register(
+                    stream: stream,
+                    fileName: item.name,
+                    wrapWithReadAheadCache: true,
+                    cacheConfig: cacheConfig
+                )
+                self.activeStreamToken = registered.token
+                self.activeStreamURL = registered.url
+
+                do {
+                    try await engine.load(
+                        url: registered.url,
+                        fileName: item.name,
+                        startAt: effectiveStartAt,
+                        preference: enginePreference
+                    )
+                    openedProvider = provider
+                    openedURL = registered.url
+                    break
+                } catch is CancellationError {
+                    throw CancellationError()
+                } catch {
+                    if let token = self.activeStreamToken {
+                        env.proxy.setScrubMode(false, for: token)
+                        env.proxy.unregister(token: token)
+                        self.activeStreamToken = nil
+                    }
+                    engine.shutdown()
+                    if attempt == 2 {
+                        throw error
+                    }
+                    await env.invalidateCachedProvider(for: request.source.id)
+                    try? await Task.sleep(nanoseconds: 150_000_000)
+                }
+            }
+
+            guard let provider = openedProvider, let streamURL = openedURL, !didShutdown else {
+                isLoadingMedia = false
+                return
+            }
+
+            isLoadingMedia = false
 
             let localScrub = scrubEngine
-            let streamURL = registered.url
             let smbProvider = provider as? AMSMB2Provider
             let itemPath = item.path
             scrubPrepareTask?.cancel()
-            scrubPrepareTask = Task.detached(priority: .userInitiated) {
+            scrubPrepareTask = Task.detached(priority: .utility) {
                 let directReader = try? await smbProvider?.openSynchronousScrubReader(at: itemPath)
                 await localScrub.prepare(url: streamURL, directReader: directReader)
             }
-
-            let effectiveStartAt = env.settings.enableResumePlayback ? startAt : 0
-            try await engine.load(
-                url: registered.url,
-                fileName: item.name,
-                startAt: effectiveStartAt,
-                preference: enginePreference
-            )
-            isLoadingMedia = false
 
             if engine.activeEngineKind == .avPlayer {
                 DisplayModeCoordinator.shared.apply(
@@ -574,9 +693,13 @@ struct PlayerScreenView: View {
             Task { @MainActor in
                 await loadSubtitles(provider: provider, for: item)
             }
+        } catch is CancellationError {
+            isLoadingMedia = false
         } catch {
             isLoadingMedia = false
-            loadError = error.localizedDescription
+            if !didShutdown {
+                loadError = error.localizedDescription
+            }
         }
     }
 
@@ -736,8 +859,8 @@ struct PlayerScreenView: View {
     private func makePreviewFrameLoader() -> MXScrubController.PreviewFrameLoader {
         let localScrubEngine = scrubEngine
         let localEngine = engine
-        return { target in
-            let outcome = await localScrubEngine.decodePreviewFrame(at: target)
+        return { target, speed in
+            let outcome = await localScrubEngine.decodePreviewFrame(at: target, requestedSpeed: speed)
             switch outcome {
             case .frame, .unchanged:
                 return outcome
@@ -808,8 +931,12 @@ struct PlayerScreenView: View {
         hudHideTask?.cancel()
         showHUD = false
         if env.settings.longPressSeekMode == .continuousFastPlay && direction == .forward && !scrub.isScrubbing {
+            fastPlayAnchorTime = engine.currentTime
+            fastPlayStartWallTime = CACurrentMediaTime()
+            fastPlayMeasuredRate = 3.0
             isFastPlaying = true
             fastPlayDirection = direction
+            engine.setMuted(true)
             engine.setPlaybackRate(3.0)
             engine.play()
             return
@@ -828,6 +955,7 @@ struct PlayerScreenView: View {
     private func endLongHold() {
         if isFastPlaying {
             isFastPlaying = false
+            engine.setMuted(false)
             engine.setPlaybackRate(1.0)
             return
         }
@@ -860,10 +988,10 @@ struct PlayerScreenView: View {
         }
     }
 
-    private func persistProgress(_ time: TimeInterval) {
+    private func persistProgress(_ time: TimeInterval, force: Bool = false) {
         guard env.settings.enableResumePlayback else { return }
         let second = Int(time)
-        guard second != lastReportedSecond else { return }
+        guard force || second != lastReportedSecond else { return }
         lastReportedSecond = second
         guard engine.duration > 0 else { return }
         let record = PlaybackHistoryRecord(

@@ -11,6 +11,7 @@ import AppPreferences
 @MainActor
 public final class AppEnvironment: ObservableObject {
     public static let shared = AppEnvironment()
+    public static let appDidReturnToForegroundNotification = Notification.Name("local.personal.auratv.didReturnToForeground")
 
     public let settingsStore: AppSettingsStore
     public let sourceStore: MediaSourceStore
@@ -242,6 +243,27 @@ public final class AppEnvironment: ObservableObject {
         if let existing = providerPool.removeValue(forKey: sourceID) {
             await existing.disconnect()
         }
+    }
+
+    public func invalidateAllProviders() async {
+        let existing = providerPool
+        providerPool.removeAll()
+        connectedSourceIDs.removeAll()
+        for (_, provider) in existing {
+            await provider.disconnect()
+        }
+    }
+
+    /// Rebinds local HTTP Range proxy and drops stale LAN sockets whenever tvOS resumes from Home Screen.
+    public func handleReturnToForeground() async {
+        do {
+            try proxy.ensureRunning(forceRestart: true)
+            proxyError = nil
+        } catch {
+            proxyError = error.localizedDescription
+        }
+        await invalidateAllProviders()
+        NotificationCenter.default.post(name: Self.appDidReturnToForegroundNotification, object: nil)
     }
 
     public func preconnectSavedSources() async {

@@ -54,21 +54,26 @@ public final class KSEngineAdapter: NSObject, ObservableObject, PlayerEngineProt
     public private(set) var videoFormatDescription: CMFormatDescription?
 
     private var playerLayer: KSPlayerLayer?
-    private var options: AuraKSOptions
+    private var activeOptions: AuraKSOptions?
     private var loadContinuation: CheckedContinuation<Void, Error>?
+    private var loadTimeoutTask: Task<Void, Never>?
     private var stats = PlaybackStats(engineName: "KSPlayer")
 
     public override init() {
+        super.init()
+    }
+
+    private func makeFreshOptions() -> AuraKSOptions {
         let opts = AuraKSOptions()
         opts.playerTypes = [KSMEPlayer.self, KSAVPlayer.self]
         opts.videoDecodeType = .asynchronousHardware
         opts.isAutoPlay = true
-        opts.isSecondOpen = true
-        opts.isAccurateSeek = true
+        // Always open cleanly from t=0 on a fresh layer; seek after readyToPlay for resume reliability.
+        opts.isSecondOpen = false
+        opts.startPlayTime = 0
+        opts.isAccurateSeek = false
         opts.isSeekedAutoPlay = true
         opts.seekUsePacketCache = true
-        // Critical for MX live fast-forward: interrupt stale SMB/WebDAV IO immediately on seek
-        // and snap directly to nearest backward I-frame (AVSEEK_FLAG_BACKWARD = 1).
         opts.seekInterruptIO = true
         opts.seekFlags = 1
         opts.changeDV7ToDV81 = true
@@ -76,16 +81,22 @@ public final class KSEngineAdapter: NSObject, ObservableObject, PlayerEngineProt
         opts.videoSoftDecodeThreadCount = 4
         opts.preferredForwardBufferDuration = 1.5
         opts.maxBufferDuration = 16
-        opts.formatContextOptions["probesize"] = 512 * 1024
-        opts.formatContextOptions["analyzeduration"] = 500_000
-        self.options = opts
-        super.init()
-
+        opts.formatContextOptions["probesize"] = 2 * 1024 * 1024
+        opts.formatContextOptions["analyzeduration"] = 2_000_000
         opts.onVideoMetadata = { [weak self] refreshRate, formatDesc in
             guard let self else { return }
             self.videoFormatDescription = formatDesc
             DisplayModeCoordinator.shared.apply(refreshRate: refreshRate, formatDescription: formatDesc)
         }
+        return opts
+    }
+
+    private func finishLoadContinuation(with result: Result<Void, Error>) {
+        loadTimeoutTask?.cancel()
+        loadTimeoutTask = nil
+        guard let cont = loadContinuation else { return }
+        loadContinuation = nil
+        cont.resume(with: result)
     }
 
     public func makeLayerView() -> UIView? {
@@ -98,24 +109,45 @@ public final class KSEngineAdapter: NSObject, ObservableObject, PlayerEngineProt
 
     public func load(url: URL, startAt time: TimeInterval) async throws {
         lastError = nil
-        options.startPlayTime = max(0, time)
-        options.isAccurateSeek = (time > 0)
-        options.isSeekedAutoPlay = true
+        finishLoadContinuation(with: .failure(CancellationError()))
 
         if let existing = playerLayer {
             existing.delegate = nil
             existing.stop()
             existing.reset()
+            playerLayer = nil
         }
 
-        let layer = KSPlayerLayer(url: url, options: options, delegate: self)
+        let opts = makeFreshOptions()
+        self.activeOptions = opts
+
+        let layer = KSPlayerLayer(url: url, options: opts, delegate: self)
         self.playerLayer = layer
         // Notify KSLayerRepresentable immediately so the Metal/VideoToolbox surface is mounted into the window!
         self.layerRevision += 1
 
         try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
             self.loadContinuation = continuation
+            self.loadTimeoutTask = Task { @MainActor [weak self] in
+                try? await Task.sleep(nanoseconds: 15_000_000_000)
+                guard let self, !Task.isCancelled else { return }
+                let timeoutErr = NSError(
+                    domain: "AuraTV.KSEngine",
+                    code: -1001,
+                    userInfo: [NSLocalizedDescriptionKey: "播放器初始化超时，请重试"]
+                )
+                self.finishLoadContinuation(with: .failure(timeoutErr))
+            }
             layer.prepareToPlay()
+        }
+
+        guard self.playerLayer === layer else { throw CancellationError() }
+        if time > 0.5 {
+            opts.isAccurateSeek = false
+            opts.isSeekedAutoPlay = true
+            await performGuardedSeek(layer: layer, time: time, autoPlay: true, timeoutNs: 2_500_000_000)
+            layer.play()
+            isPlaying = true
         }
     }
 
@@ -131,15 +163,15 @@ public final class KSEngineAdapter: NSObject, ObservableObject, PlayerEngineProt
 
     public func seek(to time: TimeInterval, precise: Bool) async {
         guard let playerLayer else { return }
-        options.isAccurateSeek = precise
-        options.isSeekedAutoPlay = isPlaying
+        activeOptions?.isAccurateSeek = precise
+        activeOptions?.isSeekedAutoPlay = isPlaying
         await performGuardedSeek(layer: playerLayer, time: max(0, time), autoPlay: isPlaying, timeoutNs: 2_000_000_000)
     }
 
     public func seekToKeyframePreview(at time: TimeInterval) async {
         guard let playerLayer else { return }
-        options.isAccurateSeek = false
-        options.isSeekedAutoPlay = false
+        activeOptions?.isAccurateSeek = false
+        activeOptions?.isSeekedAutoPlay = false
         // 500ms timeout guarantees single-flight scrubbing NEVER hangs if KSPlayer drops an older seek callback.
         await performGuardedSeek(layer: playerLayer, time: max(0, time), autoPlay: false, timeoutNs: 500_000_000)
     }
@@ -232,22 +264,21 @@ public final class KSEngineAdapter: NSObject, ObservableObject, PlayerEngineProt
                 droppedFrames: Int(info.droppedVideoFrameCount),
                 readMbps: Double(info.networkSpeed) * 8.0 / 1_000_000.0,
                 memoryMB: Self.residentMemoryMB(),
-                isHardwareDecoding: options.videoDecodeType != .software
+                isHardwareDecoding: (activeOptions?.videoDecodeType ?? .asynchronousHardware) != .software
             )
         }
         return stats
     }
 
     public func shutdown() {
+        isPlaying = false
         playerLayer?.delegate = nil
         playerLayer?.stop()
         playerLayer?.reset()
         playerLayer = nil
+        activeOptions = nil
         layerRevision += 1
-        if let cont = loadContinuation {
-            loadContinuation = nil
-            cont.resume(throwing: CancellationError())
-        }
+        finishLoadContinuation(with: .failure(CancellationError()))
     }
 
     private func refreshTracks() {
@@ -275,6 +306,7 @@ public final class KSEngineAdapter: NSObject, ObservableObject, PlayerEngineProt
     // MARK: - KSPlayerLayerDelegate
 
     public func player(layer: KSPlayerLayer, state: KSPlayerState) {
+        guard layer === self.playerLayer else { return }
         isPlaying = state.isPlaying
         if state == .readyToPlay {
             duration = layer.player.duration
@@ -289,14 +321,12 @@ public final class KSEngineAdapter: NSObject, ObservableObject, PlayerEngineProt
                     formatDescription: desc
                 )
             }
-            if let cont = loadContinuation {
-                loadContinuation = nil
-                cont.resume()
-            }
+            finishLoadContinuation(with: .success(()))
         }
     }
 
     public func player(layer: KSPlayerLayer, currentTime: TimeInterval, totalTime: TimeInterval) {
+        guard layer === self.playerLayer else { return }
         self.currentTime = currentTime
         if totalTime > 0 {
             self.duration = totalTime
@@ -304,16 +334,15 @@ public final class KSEngineAdapter: NSObject, ObservableObject, PlayerEngineProt
     }
 
     public func player(layer: KSPlayerLayer, finish error: (any Error)?) {
+        guard layer === self.playerLayer else { return }
         isPlaying = false
         if let error {
             lastError = error.localizedDescription
-            if let cont = loadContinuation {
-                loadContinuation = nil
-                cont.resume(throwing: error)
+            if loadContinuation != nil {
+                finishLoadContinuation(with: .failure(error))
             }
-        } else if let cont = loadContinuation {
-            loadContinuation = nil
-            cont.resume()
+        } else if loadContinuation != nil {
+            finishLoadContinuation(with: .success(()))
         } else {
             onPlaybackEnded?()
         }

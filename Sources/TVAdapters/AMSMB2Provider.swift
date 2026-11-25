@@ -422,7 +422,13 @@ public final class AMSMB2Provider: VFSProvider, @unchecked Sendable {
             let file = try await manager.openRandomAccessFile(shareName: resolved.share, atPath: resolved.relativePath)
             return AMSMB2RandomAccessStream(file: file)
         } catch {
-            throw Self.classifySMBError(error, share: resolved.share)
+            try await ensureShareConnected(resolved.share, using: manager, forceReconnect: true)
+            do {
+                let file = try await manager.openRandomAccessFile(shareName: resolved.share, atPath: resolved.relativePath)
+                return AMSMB2RandomAccessStream(file: file)
+            } catch {
+                throw Self.classifySMBError(error, share: resolved.share)
+            }
         }
     }
 
@@ -438,7 +444,13 @@ public final class AMSMB2Provider: VFSProvider, @unchecked Sendable {
             let file = try await manager.openRandomAccessFile(shareName: resolved.share, atPath: resolved.relativePath)
             return SMB2SynchronousReader(file: file)
         } catch {
-            throw Self.classifySMBError(error, share: resolved.share)
+            try await ensureShareConnected(resolved.share, using: manager, forceReconnect: true)
+            do {
+                let file = try await manager.openRandomAccessFile(shareName: resolved.share, atPath: resolved.relativePath)
+                return SMB2SynchronousReader(file: file)
+            } catch {
+                throw Self.classifySMBError(error, share: resolved.share)
+            }
         }
     }
 

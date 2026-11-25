@@ -1,5 +1,6 @@
 import Foundation
 import CoreGraphics
+import CoreVideo
 import ImageIO
 import CoreImage
 import CoreMedia
@@ -19,13 +20,37 @@ import Libavformat
 #endif
 #endif
 
+/// Wraps a VideoToolbox `CVPixelBuffer` for zero-copy cross-actor transport to the GPU display layer.
+public final class SendablePixelBuffer: @unchecked Sendable {
+    public let buffer: CVPixelBuffer
+
+    public init(_ buffer: CVPixelBuffer) {
+        self.buffer = buffer
+    }
+}
+
+public enum ScrubFrameContent: Sendable {
+    case pixelBuffer(SendablePixelBuffer, rotation: UInt16)
+    case cgImage(CGImage)
+}
+
 /// A decoded video preview frame returned by `LiveKeyframeScrubEngine`.
 public struct ScrubPreviewFrame: Sendable {
-    public let cgImage: CGImage
+    public let content: ScrubFrameContent
     public let actualTime: TimeInterval
 
+    public var cgImage: CGImage? {
+        if case .cgImage(let img) = content { return img }
+        return nil
+    }
+
     public init(cgImage: CGImage, actualTime: TimeInterval) {
-        self.cgImage = cgImage
+        self.content = .cgImage(cgImage)
+        self.actualTime = actualTime
+    }
+
+    public init(pixelBuffer: CVPixelBuffer, rotation: UInt16 = 0, actualTime: TimeInterval) {
+        self.content = .pixelBuffer(SendablePixelBuffer(pixelBuffer), rotation: rotation)
         self.actualTime = actualTime
     }
 }
@@ -38,68 +63,188 @@ public enum ScrubDecodeOutcome: Sendable {
     case unavailable
 }
 
-/// Zero-overhead CoreAnimation layer presenter for full-screen live scrub frames.
-/// Swaps `CALayer.contents` directly with animations disabled (< 0.1ms) without triggering SwiftUI
-/// view-tree diffing on `PlayerScreenView` at 25–60 fps!
+/// Zero-copy CoreAnimation / AVSampleBufferDisplayLayer presenter for full-screen live scrub frames.
+/// Enqueues VideoToolbox `CVPixelBuffer` directly onto the GPU (~0.2ms, zero CIContext CPU readback)
+/// without triggering SwiftUI view-tree diffing on `PlayerScreenView` at 24–60 fps.
 @MainActor
 public final class ScrubFramePresenter {
     fileprivate weak var canvasView: ScrubCanvasView?
-    private var pendingImage: CGImage?
+    private var pendingContent: ScrubFrameContent?
     public private(set) var isVisible: Bool = false
 
     public init() {}
 
     fileprivate func attach(_ view: ScrubCanvasView) {
         canvasView = view
-        if let pendingImage, isVisible {
-            apply(pendingImage, to: view)
+        if let pendingContent, isVisible {
+            view.present(pendingContent)
         } else {
-            view.isHidden = !isVisible
+            view.clear()
         }
+    }
+
+    public func present(_ frame: ScrubPreviewFrame) {
+        present(frame.content)
+    }
+
+    public func present(_ content: ScrubFrameContent) {
+        pendingContent = content
+        isVisible = true
+        canvasView?.present(content)
     }
 
     public func present(_ cgImage: CGImage) {
-        pendingImage = cgImage
-        isVisible = true
-        if let view = canvasView {
-            apply(cgImage, to: view)
-        }
+        present(.cgImage(cgImage))
     }
 
     public func clear() {
-        pendingImage = nil
+        pendingContent = nil
         isVisible = false
-        guard let view = canvasView else { return }
-        CATransaction.begin()
-        CATransaction.setDisableActions(true)
-        view.layer.contents = nil
-        view.isHidden = true
-        CATransaction.commit()
-    }
-
-    private func apply(_ image: CGImage, to view: ScrubCanvasView) {
-        CATransaction.begin()
-        CATransaction.setDisableActions(true)
-        view.layer.contents = image
-        view.isHidden = false
-        CATransaction.commit()
+        canvasView?.clear()
     }
 }
 
 final class ScrubCanvasView: UIView {
+    private let displayLayer = AVSampleBufferDisplayLayer()
+    private var currentRotation: UInt16 = 0
+    private lazy var fallbackCIContext = CIContext(options: [.useSoftwareRenderer: false])
+
     override init(frame: CGRect) {
         super.init(frame: frame)
         backgroundColor = .black
         isUserInteractionEnabled = false
         isHidden = true
+
         layer.contentsGravity = .resizeAspect
         layer.masksToBounds = true
         layer.magnificationFilter = .linear
         layer.minificationFilter = .linear
+
+        displayLayer.videoGravity = .resizeAspect
+        displayLayer.preventsDisplaySleepDuringVideoPlayback = true
+        displayLayer.isHidden = true
+        layer.addSublayer(displayLayer)
     }
 
     required init?(coder: NSCoder) {
         fatalError("init(coder:) has not been implemented")
+    }
+
+    override func layoutSubviews() {
+        super.layoutSubviews()
+        applyDisplayLayout(for: currentRotation)
+    }
+
+    func present(_ content: ScrubFrameContent) {
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+
+        switch content {
+        case .pixelBuffer(let box, let rotation):
+            if let sampleBuffer = Self.makeSampleBuffer(from: box.buffer) {
+                layer.contents = nil
+                if currentRotation != rotation || displayLayer.bounds.isEmpty {
+                    currentRotation = rotation
+                    applyDisplayLayout(for: rotation)
+                }
+                displayLayer.isHidden = false
+                isHidden = false
+                CATransaction.commit()
+
+                let renderer = displayLayer.sampleBufferRenderer
+                if renderer.status == .failed {
+                    renderer.flush()
+                }
+                renderer.enqueue(sampleBuffer)
+                return
+            }
+
+            // Graceful fallback only if CMSampleBuffer creation unexpectedly fails
+            var ciImage = CIImage(cvPixelBuffer: box.buffer)
+            if rotation == 90 { ciImage = ciImage.oriented(.right) }
+            else if rotation == 180 { ciImage = ciImage.oriented(.down) }
+            else if rotation == 270 { ciImage = ciImage.oriented(.left) }
+            displayLayer.isHidden = true
+            layer.contents = fallbackCIContext.createCGImage(ciImage, from: ciImage.extent.integral)
+            isHidden = false
+
+        case .cgImage(let image):
+            displayLayer.isHidden = true
+            displayLayer.sampleBufferRenderer.flush(removingDisplayedImage: true, completionHandler: nil)
+            layer.contents = image
+            isHidden = false
+        }
+
+        CATransaction.commit()
+    }
+
+    func clear() {
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        layer.contents = nil
+        displayLayer.sampleBufferRenderer.flush(removingDisplayedImage: true, completionHandler: nil)
+        displayLayer.isHidden = true
+        isHidden = true
+        CATransaction.commit()
+    }
+
+    private func applyDisplayLayout(for rotation: UInt16) {
+        let b = bounds
+        guard b.width > 0, b.height > 0 else { return }
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        displayLayer.position = CGPoint(x: b.midX, y: b.midY)
+        switch rotation {
+        case 90:
+            displayLayer.bounds = CGRect(x: 0, y: 0, width: b.height, height: b.width)
+            displayLayer.setAffineTransform(CGAffineTransform(rotationAngle: .pi / 2))
+        case 180:
+            displayLayer.bounds = b
+            displayLayer.setAffineTransform(CGAffineTransform(rotationAngle: .pi))
+        case 270:
+            displayLayer.bounds = CGRect(x: 0, y: 0, width: b.height, height: b.width)
+            displayLayer.setAffineTransform(CGAffineTransform(rotationAngle: -.pi / 2))
+        default:
+            displayLayer.bounds = b
+            displayLayer.setAffineTransform(.identity)
+        }
+        CATransaction.commit()
+    }
+
+    private static func makeSampleBuffer(from pixelBuffer: CVPixelBuffer) -> CMSampleBuffer? {
+        var formatDesc: CMVideoFormatDescription?
+        let fmtStatus = CMVideoFormatDescriptionCreateForImageBuffer(
+            allocator: kCFAllocatorDefault,
+            imageBuffer: pixelBuffer,
+            formatDescriptionOut: &formatDesc
+        )
+        guard fmtStatus == noErr, let formatDesc else { return nil }
+
+        var timing = CMSampleTimingInfo(
+            duration: .invalid,
+            presentationTimeStamp: .zero,
+            decodeTimeStamp: .invalid
+        )
+        var sampleBuffer: CMSampleBuffer?
+        let bufStatus = CMSampleBufferCreateReadyWithImageBuffer(
+            allocator: kCFAllocatorDefault,
+            imageBuffer: pixelBuffer,
+            formatDescription: formatDesc,
+            sampleTiming: &timing,
+            sampleBufferOut: &sampleBuffer
+        )
+        guard bufStatus == noErr, let sampleBuffer else { return nil }
+
+        if let attachments = CMSampleBufferGetSampleAttachmentsArray(sampleBuffer, createIfNecessary: true),
+           CFArrayGetCount(attachments) > 0 {
+            let dict = unsafeBitCast(CFArrayGetValueAtIndex(attachments, 0), to: CFMutableDictionary.self)
+            CFDictionarySetValue(
+                dict,
+                Unmanaged.passUnretained(kCMSampleAttachmentKey_DisplayImmediately).toOpaque(),
+                Unmanaged.passUnretained(kCFBooleanTrue).toOpaque()
+            )
+        }
+        return sampleBuffer
     }
 }
 
@@ -552,7 +697,7 @@ public final class LiveKeyframeScrubEngine: @unchecked Sendable {
         }
     }
 
-    public func decodePreviewFrame(at targetTime: TimeInterval) async -> ScrubDecodeOutcome {
+    public func decodePreviewFrame(at targetTime: TimeInterval, requestedSpeed: Double = 8.0) async -> ScrubDecodeOutcome {
         let myGen = latestGeneration.withLock { gen -> UInt64 in
             gen &+= 1
             return gen
@@ -564,7 +709,11 @@ public final class LiveKeyframeScrubEngine: @unchecked Sendable {
                     cont.resume(returning: .unavailable)
                     return
                 }
-                let outcome = decodeOnQueue(targetTime: max(0, targetTime), generation: myGen)
+                let outcome = decodeOnQueue(
+                    targetTime: max(0, targetTime),
+                    requestedSpeed: max(1.0, requestedSpeed),
+                    generation: myGen
+                )
                 cont.resume(returning: outcome)
             }
         }
@@ -613,7 +762,7 @@ public final class LiveKeyframeScrubEngine: @unchecked Sendable {
         return fallback
     }
 
-    private func decodeOnQueue(targetTime: TimeInterval, generation: UInt64) -> ScrubDecodeOutcome {
+    private func decodeOnQueue(targetTime: TimeInterval, requestedSpeed: Double, generation: UInt64) -> ScrubDecodeOutcome {
         guard let ctx = formatContext,
               let vTrack = videoTrack else {
             return .unavailable
@@ -624,31 +773,19 @@ public final class LiveKeyframeScrubEngine: @unchecked Sendable {
         lastRequestedTarget = targetTime
 
         var frame: VideoVTBFrame?
+        let preferSequential = !usingSoftwareFallback && requestedSpeed <= 20.0
 
         if movingForward {
-            // Strict forward monotonic guard: if a prior flags=0 keyframe jump landed ahead of targetTime,
-            // never seek backward into an older GOP; gently step forward or hold steady until target catches up.
-            if demuxerIsContinuous, lastRenderedTime.isFinite, targetTime <= demuxerCursorTime + 0.04 {
-                if !usingSoftwareFallback,
-                   (demuxerCursorTime - targetTime) <= 12.0,
-                   let gentle = stepForwardWithoutSeek(
-                       ctx: ctx,
-                       vTrack: vTrack,
-                       targetTime: demuxerCursorTime + 0.12,
-                       generation: generation,
-                       maxVideoFrames: 6
-                   ) {
-                    frame = gentle
-                } else {
-                    return .unchanged(actualTime: lastRenderedTime)
-                }
+            // Strict monotonic pacing guard: wait cleanly when already ahead of requested targetTime
+            if demuxerIsContinuous, lastRenderedTime.isFinite, targetTime <= demuxerCursorTime + 0.02 {
+                return .unchanged(actualTime: lastRenderedTime)
             }
 
-            // Path A: Continuous sequential forward stepping without seek/flush
+            // Path A: Continuous zero-flush sequential forward decoding (silky 20-30fps motion)
             let priorCursor = demuxerCursorTime
-            let maxStepGap = usingSoftwareFallback ? 1.5 : 4.5
-            if frame == nil,
-               demuxerIsContinuous,
+            let maxStepGap = preferSequential ? 6.5 : (usingSoftwareFallback ? 1.5 : 3.0)
+            let stepBudget: TimeInterval = preferSequential ? 0.045 : 0.075
+            if demuxerIsContinuous,
                priorCursor.isFinite,
                targetTime > priorCursor,
                (targetTime - priorCursor) <= maxStepGap {
@@ -657,7 +794,8 @@ public final class LiveKeyframeScrubEngine: @unchecked Sendable {
                     vTrack: vTrack,
                     targetTime: targetTime,
                     generation: generation,
-                    maxVideoFrames: usingSoftwareFallback ? 18 : 54
+                    maxVideoFrames: usingSoftwareFallback ? 18 : 48,
+                    timeBudget: stepBudget
                 ) {
                     let steppedTime = frameSeconds(stepped, vTrack: vTrack, fallback: targetTime)
                     if steppedTime > priorCursor + 0.01 {
@@ -670,7 +808,7 @@ public final class LiveKeyframeScrubEngine: @unchecked Sendable {
                 }
             }
 
-            // Path B: Keyframe seek + anti-GOP-freeze progression
+            // Path B: Keyframe seek + smooth intra-GOP step-up without burst jumps
             if frame == nil {
                 demuxerIsContinuous = false
                 var primary = seekAndDecodeSingleFrame(
@@ -688,15 +826,16 @@ public final class LiveKeyframeScrubEngine: @unchecked Sendable {
                     let forwardGap = targetTime - t1
 
                     if behindLast {
-                        if !usingSoftwareFallback,
-                           forwardGap <= 4.5,
+                        if preferSequential,
+                           forwardGap <= 6.5,
                            targetTime > stepFromCursor,
                            let stepped = stepForwardWithoutSeek(
                                ctx: ctx,
                                vTrack: vTrack,
                                targetTime: targetTime,
                                generation: generation,
-                               maxVideoFrames: 54
+                               maxVideoFrames: 64,
+                               timeBudget: 0.065
                            ) {
                             primary = stepped
                         } else if let nextIFrame = seekAndDecodeSingleFrame(
@@ -710,14 +849,15 @@ public final class LiveKeyframeScrubEngine: @unchecked Sendable {
                         }
                     } else if !lastRenderedTime.isFinite,
                               !usingSoftwareFallback,
-                              forwardGap > 0.25,
-                              forwardGap <= 4.0,
+                              forwardGap > 0.15,
+                              forwardGap <= 6.0,
                               let stepped = stepForwardWithoutSeek(
                                   ctx: ctx,
                                   vTrack: vTrack,
                                   targetTime: targetTime,
                                   generation: generation,
-                                  maxVideoFrames: 54
+                                  maxVideoFrames: 72,
+                                  timeBudget: 0.09
                               ) {
                         primary = stepped
                     }
@@ -744,11 +884,11 @@ public final class LiveKeyframeScrubEngine: @unchecked Sendable {
                 let t1 = frameSeconds(f1, vTrack: vTrack, fallback: targetTime)
                 let stuckOnSameGOP = (f1.timestamp != Int64.min && f1.timestamp == lastRenderedPTS)
                     || (t1 >= lastRenderedTime - 0.05)
-                if stuckOnSameGOP && (lastRenderedTime - targetTime) >= 1.0 {
+                if stuckOnSameGOP && (lastRenderedTime - targetTime) >= 0.8 {
                     if let earlier1 = seekAndDecodeSingleFrame(
                         ctx: ctx,
                         vTrack: vTrack,
-                        seekTime: max(0, lastRenderedTime - 1.0),
+                        seekTime: max(0, lastRenderedTime - 1.2),
                         flags: 1,
                         generation: generation
                     ) {
@@ -758,7 +898,7 @@ public final class LiveKeyframeScrubEngine: @unchecked Sendable {
                         } else if let earlier2 = seekAndDecodeSingleFrame(
                             ctx: ctx,
                             vTrack: vTrack,
-                            seekTime: max(0, lastRenderedTime - 9.5),
+                            seekTime: max(0, lastRenderedTime - 9.0),
                             flags: 1,
                             generation: generation
                         ) {
@@ -794,6 +934,12 @@ public final class LiveKeyframeScrubEngine: @unchecked Sendable {
         if movingBackward, lastRenderedTime.isFinite, actualTime > lastRenderedTime + 0.05 {
             demuxerCursorTime = lastRenderedTime
             return .unchanged(actualTime: lastRenderedTime)
+        }
+
+        if let cvBuffer = decoded.pixelBuffer.cvPixelBuffer {
+            lastRenderedPTS = decoded.timestamp
+            lastRenderedTime = actualTime
+            return .frame(ScrubPreviewFrame(pixelBuffer: cvBuffer, rotation: vTrack.rotation, actualTime: actualTime))
         }
 
         guard let cgImage = renderPreviewCGImage(from: decoded, rotation: vTrack.rotation) else {
@@ -856,7 +1002,8 @@ public final class LiveKeyframeScrubEngine: @unchecked Sendable {
         vTrack: FFmpegAssetTrack,
         targetTime: TimeInterval,
         generation: UInt64,
-        maxVideoFrames: Int
+        maxVideoFrames: Int,
+        timeBudget: TimeInterval = 0.05
     ) -> VideoVTBFrame? {
         guard decoder != nil else { return nil }
 
@@ -866,7 +1013,7 @@ public final class LiveKeyframeScrubEngine: @unchecked Sendable {
         var bestFrame: VideoVTBFrame?
         var bestTime: TimeInterval = -.infinity
 
-        let deadline = CFAbsoluteTimeGetCurrent() + 0.11
+        let deadline = CFAbsoluteTimeGetCurrent() + timeBudget
         while totalPackets < 260 && videoFramesDecoded < maxVideoFrames && CFAbsoluteTimeGetCurrent() < deadline {
             if currentGeneration() != generation || isClosed { return nil }
             guard let packet = ctx.read() else { break }
@@ -1035,7 +1182,8 @@ public final class LiveKeyframeScrubEngine: @unchecked Sendable {
         boxLock.withLock { $0 = box }
     }
 
-    public func decodePreviewFrame(at targetTime: TimeInterval) async -> ScrubDecodeOutcome {
+    public func decodePreviewFrame(at targetTime: TimeInterval, requestedSpeed: Double = 8.0) async -> ScrubDecodeOutcome {
+        _ = requestedSpeed
         guard let box = boxLock.withLock({ $0 }) else { return .unavailable }
         let cmTime = CMTime(seconds: max(0, targetTime), preferredTimescale: 600)
         do {

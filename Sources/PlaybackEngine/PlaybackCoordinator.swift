@@ -112,6 +112,11 @@ public final class PlaybackCoordinator: ObservableObject {
         #endif
     }
 
+    private static func isAVPlayerCompatibleContainer(_ fileName: String) -> Bool {
+        let ext = URL(fileURLWithPath: fileName).pathExtension.lowercased()
+        return ["mp4", "m4v", "mov", "ts", "m2ts", "m3u8", "mp3", "m4a", "aac"].contains(ext)
+    }
+
     public func load(url: URL, fileName: String, startAt time: TimeInterval, preference: PreferredEngineChoice = .auto) async throws {
         stopCurrentEngine()
         activeEngineKind = Self.recommendedEngine(for: fileName, preference: preference)
@@ -123,8 +128,19 @@ public final class PlaybackCoordinator: ObservableObject {
                 throw CancellationError()
             } catch {
                 ksAdapter.shutdown()
-                activeEngineKind = .avPlayer
-                try await avAdapter.load(url: url, startAt: time)
+                try await Task.sleep(nanoseconds: 150_000_000)
+                do {
+                    try await ksAdapter.load(url: url, startAt: time)
+                } catch is CancellationError {
+                    throw CancellationError()
+                } catch let retryError {
+                    ksAdapter.shutdown()
+                    guard Self.isAVPlayerCompatibleContainer(fileName) else {
+                        throw retryError
+                    }
+                    activeEngineKind = .avPlayer
+                    try await avAdapter.load(url: url, startAt: time)
+                }
             }
         } else {
             try await activeEngine.load(url: url, startAt: time)
