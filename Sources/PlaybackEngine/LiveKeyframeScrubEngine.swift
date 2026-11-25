@@ -773,7 +773,7 @@ public final class LiveKeyframeScrubEngine: @unchecked Sendable {
         lastRequestedTarget = targetTime
 
         var frame: VideoVTBFrame?
-        let preferSequential = !usingSoftwareFallback && requestedSpeed <= 20.0
+        let preferSequential = !usingSoftwareFallback && requestedSpeed <= 10.0
 
         if movingForward {
             // Strict monotonic pacing guard: wait cleanly when already ahead of requested targetTime
@@ -781,21 +781,20 @@ public final class LiveKeyframeScrubEngine: @unchecked Sendable {
                 return .unchanged(actualTime: lastRenderedTime)
             }
 
-            // Path A: Continuous zero-flush sequential forward decoding (silky 20-30fps motion)
+            // Path A: Continuous zero-flush sequential decode ONLY for silky low speeds (<= 10x)
             let priorCursor = demuxerCursorTime
-            let maxStepGap = preferSequential ? 6.5 : (usingSoftwareFallback ? 1.5 : 3.0)
-            let stepBudget: TimeInterval = preferSequential ? 0.045 : 0.075
-            if demuxerIsContinuous,
+            if preferSequential,
+               demuxerIsContinuous,
                priorCursor.isFinite,
                targetTime > priorCursor,
-               (targetTime - priorCursor) <= maxStepGap {
+               (targetTime - priorCursor) <= 4.0 {
                 if let stepped = stepForwardWithoutSeek(
                     ctx: ctx,
                     vTrack: vTrack,
                     targetTime: targetTime,
                     generation: generation,
-                    maxVideoFrames: usingSoftwareFallback ? 18 : 48,
-                    timeBudget: stepBudget
+                    maxVideoFrames: 48,
+                    timeBudget: 0.045
                 ) {
                     let steppedTime = frameSeconds(stepped, vTrack: vTrack, fallback: targetTime)
                     if steppedTime > priorCursor + 0.01 {
@@ -808,7 +807,7 @@ public final class LiveKeyframeScrubEngine: @unchecked Sendable {
                 }
             }
 
-            // Path B: Keyframe seek + smooth intra-GOP step-up without burst jumps
+            // Path B: Hardware keyframe seeking (fast above 10x + smooth intra-GOP step-up at <= 10x)
             if frame == nil {
                 demuxerIsContinuous = false
                 var primary = seekAndDecodeSingleFrame(
@@ -827,15 +826,15 @@ public final class LiveKeyframeScrubEngine: @unchecked Sendable {
 
                     if behindLast {
                         if preferSequential,
-                           forwardGap <= 6.5,
+                           forwardGap <= 4.5,
                            targetTime > stepFromCursor,
                            let stepped = stepForwardWithoutSeek(
                                ctx: ctx,
                                vTrack: vTrack,
                                targetTime: targetTime,
                                generation: generation,
-                               maxVideoFrames: 64,
-                               timeBudget: 0.065
+                               maxVideoFrames: 54,
+                               timeBudget: 0.06
                            ) {
                             primary = stepped
                         } else if let nextIFrame = seekAndDecodeSingleFrame(
@@ -848,16 +847,16 @@ public final class LiveKeyframeScrubEngine: @unchecked Sendable {
                             primary = nextIFrame
                         }
                     } else if !lastRenderedTime.isFinite,
-                              !usingSoftwareFallback,
+                              preferSequential,
                               forwardGap > 0.15,
-                              forwardGap <= 6.0,
+                              forwardGap <= 4.0,
                               let stepped = stepForwardWithoutSeek(
                                   ctx: ctx,
                                   vTrack: vTrack,
                                   targetTime: targetTime,
                                   generation: generation,
-                                  maxVideoFrames: 72,
-                                  timeBudget: 0.09
+                                  maxVideoFrames: 64,
+                                  timeBudget: 0.075
                               ) {
                         primary = stepped
                     }

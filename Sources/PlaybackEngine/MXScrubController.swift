@@ -28,7 +28,7 @@ public enum ShuttleStepResult: Equatable, Sendable {
 public final class MXScrubController: ObservableObject {
     public typealias PreviewFrameLoader = @Sendable (TimeInterval, Double) async -> ScrubDecodeOutcome
 
-    public static let shuttleSpeedTable: [Int] = [0, 2, 4, 8, 16, 32, 64]
+    public static let shuttleSpeedTable: [Int] = [0, 2, 4, 8, 16, 32, 64, 128]
 
     /// Direct GPU CoreAnimation presenter — updates video frames WITHOUT triggering SwiftUI view diffs!
     public let framePresenter = ScrubFramePresenter()
@@ -112,11 +112,11 @@ public final class MXScrubController: ObservableObject {
         let t = max(0, elapsedHold)
         switch profile {
         case .gentle:
-            return min(32.0, 2.0 * pow(1.85, t))
+            return min(60.0, 4.0 * pow(2.15, t))
         case .mxStandard:
-            return min(64.0, 4.0 * pow(1.95, t))
+            return min(120.0, 6.0 * pow(2.25, t))
         case .turbo:
-            return min(128.0, 6.0 * pow(2.15, t))
+            return min(240.0, 10.0 * pow(2.40, t))
         }
     }
 
@@ -415,7 +415,7 @@ public final class MXScrubController: ObservableObject {
 
         // Closed-loop lead clamping: prevent virtual clock/bar from running away from decoded frames.
         if hasRenderedFrameInSession {
-            let maxLead = max(0.45, min(3.5, speed * 0.20))
+            let maxLead = max(0.8, speed * 0.45)
             if dirSign > 0 {
                 if desired > displayedFrameTime + maxLead {
                     desired = max(targetTime, displayedFrameTime + maxLead)
@@ -443,7 +443,7 @@ public final class MXScrubController: ObservableObject {
         let now = CACurrentMediaTime()
         lastFrameWallTime = now
         speedSamples.append((wall: now, media: actualTime))
-        let windowStart = now - 0.50
+        let windowStart = now - 0.65
         while speedSamples.count > 2, let first = speedSamples.first, first.wall < windowStart {
             speedSamples.removeFirst()
         }
@@ -472,7 +472,7 @@ public final class MXScrubController: ObservableObject {
                         if case .shortStep = self.activeMode { isShort = true } else { isShort = false }
                         if !isShort {
                             let overshoot = (self.displayedFrameTime - nextTarget) * self.currentDirectionSign
-                            let maxHoldMedia = max(0.35, self.currentRequestedSpeed * 0.35)
+                            let maxHoldMedia = max(0.35, self.currentRequestedSpeed * 0.25)
                             if overshoot > maxHoldMedia {
                                 self.targetTime = self.clampTime(self.displayedFrameTime, duration: self.currentDuration)
                                 self.deltaSeconds = self.targetTime - self.anchorTime

@@ -24,9 +24,9 @@ public enum LongPressSpeedProfile: String, CaseIterable, Codable, Sendable {
 
     public var displayName: String {
         switch self {
-        case .gentle:     return "精细 (2x→32x)"
-        case .mxStandard: return "标准丝滑 (4x→64x)"
-        case .turbo:      return "极速 (6x→128x)"
+        case .gentle:     return "精细 (4x→60x)"
+        case .mxStandard: return "标准丝滑 (6x→120x)"
+        case .turbo:      return "极速 (10x→240x)"
         }
     }
 }
