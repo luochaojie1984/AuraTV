@@ -94,16 +94,10 @@ public final class PlaybackCoordinator: ObservableObject {
     public static func recommendedEngine(for fileName: String, preference: PreferredEngineChoice = .auto) -> PreferredEngineChoice {
         #if canImport(KSPlayer) && !targetEnvironment(simulator)
         switch preference {
-        case .ksPlayer:
+        case .ksPlayer, .auto:
             return .ksPlayer
         case .avPlayer:
             return .avPlayer
-        case .auto:
-            let ext = URL(fileURLWithPath: fileName).pathExtension.lowercased()
-            if ["mp4", "m4v", "mov"].contains(ext) {
-                return .avPlayer
-            }
-            return .ksPlayer
         }
         #else
         return .avPlayer
@@ -121,7 +115,23 @@ public final class PlaybackCoordinator: ObservableObject {
     public func load(url: URL, fileName: String, startAt time: TimeInterval, preference: PreferredEngineChoice = .auto) async throws {
         stopCurrentEngine()
         activeEngineKind = Self.recommendedEngine(for: fileName, preference: preference)
+        #if canImport(KSPlayer) && !targetEnvironment(simulator)
+        if preference == .auto && activeEngineKind == .ksPlayer {
+            do {
+                try await ksAdapter.load(url: url, startAt: time)
+            } catch is CancellationError {
+                throw CancellationError()
+            } catch {
+                ksAdapter.shutdown()
+                activeEngineKind = .avPlayer
+                try await avAdapter.load(url: url, startAt: time)
+            }
+        } else {
+            try await activeEngine.load(url: url, startAt: time)
+        }
+        #else
         try await activeEngine.load(url: url, startAt: time)
+        #endif
         activeEngine.setAspectMode(aspectMode)
         activeEngine.setPlaybackRate(playbackRate)
     }

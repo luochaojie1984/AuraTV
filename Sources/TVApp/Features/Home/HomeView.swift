@@ -201,7 +201,7 @@ struct HomeView: View {
         VStack(alignment: .leading, spacing: 18) {
             sectionTitle("继续观看")
             ScrollView(.horizontal, showsIndicators: false) {
-                HStack(spacing: 24) {
+                HStack(spacing: 28) {
                     ForEach(env.continueWatching) { record in
                         Button {
                             replay(record)
@@ -222,9 +222,9 @@ struct HomeView: View {
     }
 
     private var sourcesSection: some View {
-        VStack(alignment: .leading, spacing: 18) {
+        VStack(alignment: .leading, spacing: 20) {
             sectionTitle("服务器")
-            LazyVGrid(columns: [GridItem(.adaptive(minimum: 420), spacing: 24)], spacing: 24) {
+            LazyVGrid(columns: [GridItem(.adaptive(minimum: 460), spacing: 24)], spacing: 24) {
                 ForEach(env.sources) { source in
                     Button {
                         browserTarget = BrowserTarget(source: source)
@@ -249,29 +249,29 @@ struct HomeView: View {
     }
 
     private var addServerTile: some View {
-        HStack(spacing: 18) {
-            RoundedRectangle(cornerRadius: 16, style: .continuous)
+        HStack(spacing: 20) {
+            RoundedRectangle(cornerRadius: 18, style: .continuous)
                 .fill(Color.white.opacity(0.08))
-                .frame(width: 64, height: 64)
+                .frame(width: 76, height: 76)
                 .overlay(
                     Image(systemName: "plus")
-                        .font(.system(size: 28, weight: .semibold))
+                        .font(.system(size: 34, weight: .semibold))
                         .foregroundStyle(TVTheme.accent)
                 )
 
             VStack(alignment: .leading, spacing: 6) {
                 Text("添加服务器")
-                    .font(.system(size: 24, weight: .semibold))
+                    .font(.system(size: 30, weight: .bold))
                     .foregroundStyle(.white)
                 Text("SMB / WebDAV")
-                    .font(.system(size: 16))
+                    .font(.system(size: 22))
                     .foregroundStyle(TVTheme.secondaryText)
             }
             Spacer()
         }
-        .padding(.horizontal, 22)
-        .padding(.vertical, 20)
-        .frame(height: 124)
+        .padding(.horizontal, 24)
+        .padding(.vertical, 22)
+        .frame(height: 148)
     }
 
     private var discoverySection: some View {
@@ -316,8 +316,8 @@ struct HomeView: View {
 
     private func sectionTitle(_ text: String) -> some View {
         Text(text)
-            .font(.system(size: 28, weight: .bold))
-            .foregroundStyle(.white.opacity(0.92))
+            .font(.system(size: 34, weight: .bold))
+            .foregroundStyle(.white.opacity(0.94))
     }
 
     private func connectAndRememberDiscovered(_ host: DiscoveredLANHost) {
@@ -351,48 +351,48 @@ struct SourceCard: View {
     var isConnected: Bool = false
 
     var body: some View {
-        HStack(spacing: 18) {
-            RoundedRectangle(cornerRadius: 16, style: .continuous)
+        HStack(spacing: 20) {
+            RoundedRectangle(cornerRadius: 18, style: .continuous)
                 .fill(
                     LinearGradient(
                         colors: source.protocolType == .smb
-                            ? [Color(red: 0.14, green: 0.62, blue: 0.96).opacity(0.85), Color(red: 0.16, green: 0.36, blue: 0.85).opacity(0.85)]
-                            : [Color(red: 0.48, green: 0.36, blue: 0.95).opacity(0.85), Color(red: 0.30, green: 0.22, blue: 0.78).opacity(0.85)],
+                            ? [Color(red: 0.14, green: 0.62, blue: 0.96).opacity(0.88), Color(red: 0.16, green: 0.36, blue: 0.85).opacity(0.88)]
+                            : [Color(red: 0.48, green: 0.36, blue: 0.95).opacity(0.88), Color(red: 0.30, green: 0.22, blue: 0.78).opacity(0.88)],
                         startPoint: .topLeading,
                         endPoint: .bottomTrailing
                     )
                 )
-                .frame(width: 64, height: 64)
+                .frame(width: 76, height: 76)
                 .overlay(
                     Image(systemName: source.protocolType == .smb ? "externaldrive.fill" : "globe")
-                        .font(.system(size: 28, weight: .semibold))
+                        .font(.system(size: 34, weight: .semibold))
                         .foregroundStyle(.white)
                 )
 
             VStack(alignment: .leading, spacing: 6) {
-                HStack(spacing: 8) {
+                HStack(spacing: 10) {
                     Text(source.displayName)
-                        .font(.system(size: 25, weight: .semibold))
+                        .font(.system(size: 30, weight: .bold))
                         .lineLimit(1)
                     if isConnected {
                         Circle()
                             .fill(Color.green)
-                            .frame(width: 8, height: 8)
+                            .frame(width: 10, height: 10)
                     }
                 }
                 Text("\(source.protocolType.rawValue.uppercased()) · \(source.host)")
-                    .font(.system(size: 17))
+                    .font(.system(size: 22))
                     .foregroundStyle(TVTheme.secondaryText)
                     .lineLimit(1)
             }
             Spacer()
             Image(systemName: "chevron.right")
-                .font(.system(size: 18, weight: .semibold))
-                .foregroundStyle(.white.opacity(0.35))
+                .font(.system(size: 22, weight: .semibold))
+                .foregroundStyle(.white.opacity(0.42))
         }
-        .padding(.horizontal, 22)
-        .padding(.vertical, 20)
-        .frame(height: 124)
+        .padding(.horizontal, 24)
+        .padding(.vertical, 22)
+        .frame(height: 148)
     }
 }
 
@@ -436,7 +436,7 @@ struct ContinueWatchingCard: View {
                 Spacer()
 
                 Text(record.fileName)
-                    .font(.system(size: 22, weight: .semibold))
+                    .font(.system(size: 26, weight: .bold))
                     .lineLimit(2)
                     .multilineTextAlignment(.leading)
 
@@ -448,15 +448,15 @@ struct ContinueWatchingCard: View {
                             .frame(width: max(0, proxy.size.width * min(max(record.progressRatio, 0), 1)))
                     }
                 }
-                .frame(height: 4)
+                .frame(height: 6)
 
                 Text("剩余 \(formatted(record.remainingSeconds))")
-                    .font(.system(size: 15, weight: .medium))
+                    .font(.system(size: 20, weight: .medium))
                     .foregroundStyle(TVTheme.secondaryText)
             }
-            .padding(22)
+            .padding(24)
         }
-        .frame(width: 420, height: 236)
+        .frame(width: 480, height: 268)
         .clipShape(RoundedRectangle(cornerRadius: 24, style: .continuous))
     }
 

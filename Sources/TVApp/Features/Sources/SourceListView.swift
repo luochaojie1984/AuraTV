@@ -42,15 +42,18 @@ struct SourceListView: View {
                             }
                             .buttonStyle(TVCardButtonStyle())
 
-                            VStack(spacing: 12) {
+                            VStack(spacing: 14) {
                                 Button("编辑") { editingSource = source }
                                     .buttonStyle(.bordered)
+                                    .font(.system(size: 22, weight: .semibold))
                                 Button("测速") { speedTestSource = source }
                                     .buttonStyle(.bordered)
+                                    .font(.system(size: 22, weight: .semibold))
                                 Button("删除", role: .destructive) {
                                     Task { try? await env.delete(source: source) }
                                 }
                                 .buttonStyle(.bordered)
+                                .font(.system(size: 22, weight: .semibold))
                             }
                         }
                         .focusSection()

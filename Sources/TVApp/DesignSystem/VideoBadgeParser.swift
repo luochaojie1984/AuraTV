@@ -68,10 +68,10 @@ public struct BadgeRow: View {
         HStack(spacing: 8) {
             ForEach(badges) { badge in
                 Text(badge.text)
-                    .font(.system(size: 18, weight: .bold))
+                    .font(.system(size: 20, weight: .bold))
                     .foregroundStyle(.black.opacity(0.86))
-                    .padding(.horizontal, 10)
-                    .padding(.vertical, 3)
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 4)
                     .background(
                         Color(hex: badge.tint).opacity(0.92),
                         in: Capsule()

@@ -63,16 +63,21 @@ public final class KSEngineAdapter: NSObject, ObservableObject, PlayerEngineProt
         opts.playerTypes = [KSMEPlayer.self, KSAVPlayer.self]
         opts.videoDecodeType = .asynchronousHardware
         opts.isAutoPlay = true
+        opts.isSecondOpen = true
         opts.isAccurateSeek = true
         opts.isSeekedAutoPlay = true
+        opts.seekUsePacketCache = true
         // Critical for MX live fast-forward: interrupt stale SMB/WebDAV IO immediately on seek
         // and snap directly to nearest backward I-frame (AVSEEK_FLAG_BACKWARD = 1).
         opts.seekInterruptIO = true
         opts.seekFlags = 1
         opts.changeDV7ToDV81 = true
         opts.autoSelectEmbedSubtitle = false
-        opts.preferredForwardBufferDuration = 6
-        opts.maxBufferDuration = 18
+        opts.videoSoftDecodeThreadCount = 4
+        opts.preferredForwardBufferDuration = 1.5
+        opts.maxBufferDuration = 16
+        opts.formatContextOptions["probesize"] = 512 * 1024
+        opts.formatContextOptions["analyzeduration"] = 500_000
         self.options = opts
         super.init()
 
@@ -94,7 +99,7 @@ public final class KSEngineAdapter: NSObject, ObservableObject, PlayerEngineProt
     public func load(url: URL, startAt time: TimeInterval) async throws {
         lastError = nil
         options.startPlayTime = max(0, time)
-        options.isAccurateSeek = true
+        options.isAccurateSeek = (time > 0)
         options.isSeekedAutoPlay = true
 
         if let existing = playerLayer {

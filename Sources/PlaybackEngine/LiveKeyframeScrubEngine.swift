@@ -140,7 +140,13 @@ private final class ScrubAVIOContext: AbstractAVIOContext, @unchecked Sendable {
     private var tailCacheStart: Int64 = -1
     private var tailCache: Data?
 
-    private let microWindowBytes: Int = 384 * 1024
+    private var isOpenPhase: Bool = true
+    private var didInspectMP4Moov: Bool = false
+    private var openMoovStart: Int64 = -1
+    private var openMoovData: Data?
+    private let openWindowBytes: Int = 2 * 1024 * 1024
+
+    private let microWindowBytes: Int = 512 * 1024
     private var microStart: Int64 = -1
     private var microData: Data = Data()
 
@@ -184,6 +190,92 @@ private final class ScrubAVIOContext: AbstractAVIOContext, @unchecked Sendable {
         return cursor
     }
 
+    func finishOpenPhase() {
+        lock.lock()
+        isOpenPhase = false
+        openMoovData = nil
+        openMoovStart = -1
+        lock.unlock()
+    }
+
+    private func readHeaderByteRangeLocked(offset: Int64, length: Int) -> Data? {
+        if let hc = headCache,
+           offset >= 0,
+           Int(offset) < hc.count,
+           (offset + Int64(length)) <= Int64(hc.count) {
+            let base = hc.startIndex
+            return Data(hc[(base + Int(offset))..<(base + Int(offset) + length)])
+        }
+        return try? reader.readSync(offset: offset, length: length)
+    }
+
+    private func preloadMP4MoovLocked() {
+        didInspectMP4Moov = true
+        guard totalSize >= 24 else { return }
+
+        if headCache == nil {
+            let headLen = Int(min(totalSize, Int64(edgePinBytes)))
+            headCache = try? reader.readSync(offset: 0, length: headLen)
+        }
+        guard let hc = headCache, hc.count >= 12 else { return }
+        let magic = hc.withUnsafeBytes { raw -> UInt32 in
+            guard let ptr = raw.baseAddress else { return 0 }
+            return ptr.loadUnaligned(fromByteOffset: 4, as: UInt32.self).bigEndian
+        }
+        guard magic == 0x66747970 else { return } // "ftyp"
+
+        var off: Int64 = 0
+        for _ in 0..<16 {
+            guard off + 8 <= totalSize else { break }
+            let hdrLen = Int(min(16, totalSize - off))
+            guard let hdr = readHeaderByteRangeLocked(offset: off, length: hdrLen), hdr.count >= 8 else { break }
+            let (rawSize, boxType) = hdr.withUnsafeBytes { raw -> (UInt32, UInt32) in
+                let p = raw.baseAddress!
+                return (
+                    p.loadUnaligned(fromByteOffset: 0, as: UInt32.self).bigEndian,
+                    p.loadUnaligned(fromByteOffset: 4, as: UInt32.self).bigEndian
+                )
+            }
+            var boxSize = Int64(rawSize)
+            if boxSize == 1 {
+                guard hdr.count >= 16 else { break }
+                let ext = hdr.withUnsafeBytes { raw -> UInt64 in
+                    raw.baseAddress!.loadUnaligned(fromByteOffset: 8, as: UInt64.self).bigEndian
+                }
+                boxSize = ext <= UInt64(Int64.max) ? Int64(ext) : Int64.max
+            } else if boxSize == 0 {
+                boxSize = totalSize - off
+            }
+            guard boxSize >= 8 else { break }
+
+            if boxType == 0x6D6F6F76 { // "moov"
+                let maxMoovBytes: Int64 = 24 * 1024 * 1024
+                guard boxSize <= maxMoovBytes else { break }
+                var buf = Data()
+                buf.reserveCapacity(Int(boxSize))
+                var pos = off
+                let end = min(totalSize, off + boxSize)
+                let step = Int64(openWindowBytes)
+                while pos < end {
+                    let wantChunk = Int(min(step, end - pos))
+                    guard let chunk = try? reader.readSync(offset: pos, length: wantChunk), !chunk.isEmpty else {
+                        return
+                    }
+                    buf.append(chunk)
+                    pos += Int64(chunk.count)
+                }
+                if !buf.isEmpty {
+                    openMoovStart = off
+                    openMoovData = buf
+                }
+                return
+            }
+
+            guard off <= totalSize - boxSize else { break }
+            off += boxSize
+        }
+    }
+
     override func read(buffer buf: UnsafeMutablePointer<UInt8>?, size: Int32) -> Int32 {
         lock.lock()
         defer { lock.unlock() }
@@ -193,6 +285,20 @@ private final class ScrubAVIOContext: AbstractAVIOContext, @unchecked Sendable {
 
         let want = Int(min(Int64(size), totalSize - cursor))
         guard want > 0 else { return Self.averrorEOF }
+
+        if isOpenPhase && !didInspectMP4Moov {
+            preloadMP4MoovLocked()
+        }
+
+        // 0. Open-phase preloaded MP4 moov cache (covers large/tail 10-14 MB moov in bulk SMB reads)
+        if openMoovStart >= 0,
+           let moov = openMoovData,
+           cursor >= openMoovStart,
+           (cursor + Int64(want)) <= (openMoovStart + Int64(moov.count)) {
+            Self.copySlice(from: moov, localStart: Int(cursor - openMoovStart), count: want, into: buf)
+            cursor += Int64(want)
+            return Int32(want)
+        }
 
         // 1. Head cache (0..<2MB)
         if cursor < Int64(edgePinBytes) {
@@ -229,7 +335,7 @@ private final class ScrubAVIOContext: AbstractAVIOContext, @unchecked Sendable {
             }
         }
 
-        // 3. Sliding 384 KB micro-buffer hit
+        // 3. Sliding 512 KB micro-buffer hit
         if microStart >= 0,
            cursor >= microStart,
            (cursor + Int64(want)) <= (microStart + Int64(microData.count)) {
@@ -238,8 +344,9 @@ private final class ScrubAVIOContext: AbstractAVIOContext, @unchecked Sendable {
             return Int32(want)
         }
 
-        // 4. Single SMB pread window fetch
-        let fetchLen = Int(min(Int64(max(want, microWindowBytes)), totalSize - cursor))
+        // 4. Single SMB pread window fetch (2 MB during open, 512 KB during scrub)
+        let windowSize = isOpenPhase ? openWindowBytes : microWindowBytes
+        let fetchLen = Int(min(Int64(max(want, windowSize)), totalSize - cursor))
         guard let fetched = try? reader.readSync(offset: cursor, length: fetchLen), !fetched.isEmpty else {
             return Self.averrorEOF
         }
@@ -258,6 +365,9 @@ private final class ScrubAVIOContext: AbstractAVIOContext, @unchecked Sendable {
             return
         }
         isClosed = true
+        isOpenPhase = false
+        openMoovData = nil
+        openMoovStart = -1
         headCache = nil
         tailCache = nil
         tailCacheStart = -1
@@ -310,7 +420,7 @@ public final class LiveKeyframeScrubEngine: @unchecked Sendable {
     ])
     private let srgbColorSpace = CGColorSpace(name: CGColorSpace.sRGB)
 
-    private let maxPreviewWidth: CGFloat = 960
+    private let maxPreviewWidth: CGFloat = 720
 
     public init() {}
 
@@ -368,7 +478,8 @@ public final class LiveKeyframeScrubEngine: @unchecked Sendable {
         opts.subtitleDisable = true
         opts.formatContextOptions["probesize"] = 512 * 1024
         opts.formatContextOptions["analyzeduration"] = 500_000
-        opts.decoderOptions["threads"] = "1"
+        opts.decoderOptions["threads"] = "4"
+        opts.videoSoftDecodeThreadCount = 4
 
         var openedCtx: FormatContext?
         var openedAVIO: ScrubAVIOContext?
@@ -377,6 +488,7 @@ public final class LiveKeyframeScrubEngine: @unchecked Sendable {
             let avio = ScrubAVIOContext(reader: directReader)
             if let directCtx = try? await FormatContext(io: .right(avio), options: opts),
                directCtx.assetTracks.contains(where: { $0.mediaType == .video }) {
+                avio.finishOpenPhase()
                 openedCtx = directCtx
                 openedAVIO = avio
             } else {
@@ -513,33 +625,108 @@ public final class LiveKeyframeScrubEngine: @unchecked Sendable {
 
         var frame: VideoVTBFrame?
 
-        // Path A: Fluid continuous forward stepping without seeking or flushing VideoToolbox (< 3-8ms per frame).
-        let priorCursor = demuxerCursorTime
-        if movingForward,
-           demuxerIsContinuous,
-           priorCursor.isFinite,
-           targetTime > priorCursor,
-           (targetTime - priorCursor) <= 2.2 {
-            if let stepped = stepForwardWithoutSeek(
-                ctx: ctx,
-                vTrack: vTrack,
-                targetTime: targetTime,
-                generation: generation,
-                maxVideoFrames: 36
-            ) {
-                let steppedTime = frameSeconds(stepped, vTrack: vTrack, fallback: targetTime)
-                if steppedTime >= priorCursor && steppedTime >= targetTime - 1.2 {
-                    frame = stepped
+        if movingForward {
+            // Strict forward monotonic guard: if a prior flags=0 keyframe jump landed ahead of targetTime,
+            // never seek backward into an older GOP; gently step forward or hold steady until target catches up.
+            if demuxerIsContinuous, lastRenderedTime.isFinite, targetTime <= demuxerCursorTime + 0.04 {
+                if !usingSoftwareFallback,
+                   (demuxerCursorTime - targetTime) <= 12.0,
+                   let gentle = stepForwardWithoutSeek(
+                       ctx: ctx,
+                       vTrack: vTrack,
+                       targetTime: demuxerCursorTime + 0.12,
+                       generation: generation,
+                       maxVideoFrames: 6
+                   ) {
+                    frame = gentle
+                } else {
+                    return .unchanged(actualTime: lastRenderedTime)
                 }
             }
-            if currentGeneration() != generation || isClosed {
-                demuxerIsContinuous = false
-                return .unavailable
-            }
-        }
 
-        // Path B: Keyframe seek + anti-GOP-freeze resolution when jumping forward > 2.2s, rewinding, or starting hold.
-        if frame == nil {
+            // Path A: Continuous sequential forward stepping without seek/flush
+            let priorCursor = demuxerCursorTime
+            let maxStepGap = usingSoftwareFallback ? 1.5 : 4.5
+            if frame == nil,
+               demuxerIsContinuous,
+               priorCursor.isFinite,
+               targetTime > priorCursor,
+               (targetTime - priorCursor) <= maxStepGap {
+                if let stepped = stepForwardWithoutSeek(
+                    ctx: ctx,
+                    vTrack: vTrack,
+                    targetTime: targetTime,
+                    generation: generation,
+                    maxVideoFrames: usingSoftwareFallback ? 18 : 54
+                ) {
+                    let steppedTime = frameSeconds(stepped, vTrack: vTrack, fallback: targetTime)
+                    if steppedTime > priorCursor + 0.01 {
+                        frame = stepped
+                    }
+                }
+                if currentGeneration() != generation || isClosed {
+                    demuxerIsContinuous = false
+                    return .unavailable
+                }
+            }
+
+            // Path B: Keyframe seek + anti-GOP-freeze progression
+            if frame == nil {
+                demuxerIsContinuous = false
+                var primary = seekAndDecodeSingleFrame(
+                    ctx: ctx,
+                    vTrack: vTrack,
+                    seekTime: targetTime,
+                    flags: 1,
+                    generation: generation
+                )
+
+                if let f1 = primary {
+                    let t1 = frameSeconds(f1, vTrack: vTrack, fallback: targetTime)
+                    let behindLast = lastRenderedTime.isFinite && (t1 <= lastRenderedTime + 0.04)
+                    let stepFromCursor = lastRenderedTime.isFinite ? lastRenderedTime : t1
+                    let forwardGap = targetTime - t1
+
+                    if behindLast {
+                        if !usingSoftwareFallback,
+                           forwardGap <= 4.5,
+                           targetTime > stepFromCursor,
+                           let stepped = stepForwardWithoutSeek(
+                               ctx: ctx,
+                               vTrack: vTrack,
+                               targetTime: targetTime,
+                               generation: generation,
+                               maxVideoFrames: 54
+                           ) {
+                            primary = stepped
+                        } else if let nextIFrame = seekAndDecodeSingleFrame(
+                            ctx: ctx,
+                            vTrack: vTrack,
+                            seekTime: max(targetTime, stepFromCursor + 0.5),
+                            flags: 0,
+                            generation: generation
+                        ) {
+                            primary = nextIFrame
+                        }
+                    } else if !lastRenderedTime.isFinite,
+                              !usingSoftwareFallback,
+                              forwardGap > 0.25,
+                              forwardGap <= 4.0,
+                              let stepped = stepForwardWithoutSeek(
+                                  ctx: ctx,
+                                  vTrack: vTrack,
+                                  targetTime: targetTime,
+                                  generation: generation,
+                                  maxVideoFrames: 54
+                              ) {
+                        primary = stepped
+                    }
+                }
+
+                frame = primary
+            }
+        } else {
+            // Moving backward (rewind)
             demuxerIsContinuous = false
             var primary = seekAndDecodeSingleFrame(
                 ctx: ctx,
@@ -549,60 +736,34 @@ public final class LiveKeyframeScrubEngine: @unchecked Sendable {
                 generation: generation
             )
 
-            if movingForward, let f1 = primary {
+            if let f1 = primary,
+               lastRenderedTime.isFinite,
+               lastRenderedTime > 0.5,
+               currentGeneration() == generation,
+               !isClosed {
                 let t1 = frameSeconds(f1, vTrack: vTrack, fallback: targetTime)
-                let gap = targetTime - t1
-                let samePTS = (f1.timestamp != Int64.min && f1.timestamp == lastRenderedPTS)
-                let initialSnap = (!lastRenderedTime.isFinite && gap > 0.25 && gap <= 2.5)
-
-                if (samePTS && gap <= 2.5) || initialSnap {
-                    // Advance smoothly from the GOP keyframe up toward targetTime instead of freezing or jumping back.
-                    if let stepped = stepForwardWithoutSeek(
+                let stuckOnSameGOP = (f1.timestamp != Int64.min && f1.timestamp == lastRenderedPTS)
+                    || (t1 >= lastRenderedTime - 0.05)
+                if stuckOnSameGOP && (lastRenderedTime - targetTime) >= 1.0 {
+                    if let earlier1 = seekAndDecodeSingleFrame(
                         ctx: ctx,
                         vTrack: vTrack,
-                        targetTime: targetTime,
-                        generation: generation,
-                        maxVideoFrames: 48
-                    ) {
-                        primary = stepped
-                    }
-                } else if samePTS && gap > 2.5 {
-                    // Long GOP at high speed: jump forward to the next I-frame with flags=0 so visuals always advance.
-                    if let nextIFrame = seekAndDecodeSingleFrame(
-                        ctx: ctx,
-                        vTrack: vTrack,
-                        seekTime: max(targetTime, t1 + 0.5),
-                        flags: 0,
-                        generation: generation
-                    ) {
-                        primary = nextIFrame
-                    }
-                }
-            } else if movingBackward,
-                      let f1 = primary,
-                      f1.timestamp != Int64.min,
-                      f1.timestamp == lastRenderedPTS,
-                      lastRenderedTime.isFinite,
-                      lastRenderedTime > 0.4,
-                      currentGeneration() == generation,
-                      !isClosed {
-                if let earlier1 = seekAndDecodeSingleFrame(
-                    ctx: ctx,
-                    vTrack: vTrack,
-                    seekTime: max(0, lastRenderedTime - 0.6),
-                    flags: 1,
-                    generation: generation
-                ) {
-                    if earlier1.timestamp != lastRenderedPTS || lastRenderedTime <= 2.5 {
-                        primary = earlier1
-                    } else if let earlier2 = seekAndDecodeSingleFrame(
-                        ctx: ctx,
-                        vTrack: vTrack,
-                        seekTime: max(0, lastRenderedTime - 2.8),
+                        seekTime: max(0, lastRenderedTime - 1.0),
                         flags: 1,
                         generation: generation
                     ) {
-                        primary = earlier2
+                        let e1Time = frameSeconds(earlier1, vTrack: vTrack, fallback: targetTime)
+                        if (earlier1.timestamp != lastRenderedPTS && e1Time < lastRenderedTime - 0.05) || lastRenderedTime <= 3.0 {
+                            primary = earlier1
+                        } else if let earlier2 = seekAndDecodeSingleFrame(
+                            ctx: ctx,
+                            vTrack: vTrack,
+                            seekTime: max(0, lastRenderedTime - 9.5),
+                            flags: 1,
+                            generation: generation
+                        ) {
+                            primary = earlier2
+                        }
                     }
                 }
             }
@@ -625,6 +786,14 @@ public final class LiveKeyframeScrubEngine: @unchecked Sendable {
 
         if decoded.timestamp != Int64.min && decoded.timestamp == lastRenderedPTS {
             return .unchanged(actualTime: actualTime)
+        }
+        if movingForward, lastRenderedTime.isFinite, actualTime < lastRenderedTime - 0.05 {
+            demuxerCursorTime = lastRenderedTime
+            return .unchanged(actualTime: lastRenderedTime)
+        }
+        if movingBackward, lastRenderedTime.isFinite, actualTime > lastRenderedTime + 0.05 {
+            demuxerCursorTime = lastRenderedTime
+            return .unchanged(actualTime: lastRenderedTime)
         }
 
         guard let cgImage = renderPreviewCGImage(from: decoded, rotation: vTrack.rotation) else {
@@ -697,7 +866,8 @@ public final class LiveKeyframeScrubEngine: @unchecked Sendable {
         var bestFrame: VideoVTBFrame?
         var bestTime: TimeInterval = -.infinity
 
-        while totalPackets < 220 && videoFramesDecoded < maxVideoFrames {
+        let deadline = CFAbsoluteTimeGetCurrent() + 0.11
+        while totalPackets < 260 && videoFramesDecoded < maxVideoFrames && CFAbsoluteTimeGetCurrent() < deadline {
             if currentGeneration() != generation || isClosed { return nil }
             guard let packet = ctx.read() else { break }
             totalPackets += 1
@@ -750,7 +920,7 @@ public final class LiveKeyframeScrubEngine: @unchecked Sendable {
         var consecutiveErrors = 0
         var decodedFrame: VideoVTBFrame?
 
-        while totalPackets < 160 && videoPacketsFed < 16 && decodedFrame == nil {
+        while totalPackets < 240 && videoPacketsFed < 32 && decodedFrame == nil {
             if currentGeneration() != generation || isClosed { return nil }
             guard let packet = ctx.read() else { break }
             totalPackets += 1

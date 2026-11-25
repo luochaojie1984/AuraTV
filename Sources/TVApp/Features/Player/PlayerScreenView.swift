@@ -525,8 +525,11 @@ struct PlayerScreenView: View {
             }
             self.activeProvider = provider
 
+            let maxCacheBytes = env.settings.readAheadCacheLimitMB * 1024 * 1024
+            let edgeBytes = min(16 * 1024 * 1024, max(4 * 1024 * 1024, maxCacheBytes / 4))
             let cacheConfig = StreamCacheConfiguration(
-                maxCacheBytes: env.settings.readAheadCacheLimitMB * 1024 * 1024
+                maxCacheBytes: maxCacheBytes,
+                protectedEdgeBytes: edgeBytes
             )
             let registered = try env.proxy.register(
                 stream: stream,
@@ -536,6 +539,16 @@ struct PlayerScreenView: View {
             )
             self.activeStreamToken = registered.token
             self.activeStreamURL = registered.url
+
+            let localScrub = scrubEngine
+            let streamURL = registered.url
+            let smbProvider = provider as? AMSMB2Provider
+            let itemPath = item.path
+            scrubPrepareTask?.cancel()
+            scrubPrepareTask = Task.detached(priority: .userInitiated) {
+                let directReader = try? await smbProvider?.openSynchronousScrubReader(at: itemPath)
+                await localScrub.prepare(url: streamURL, directReader: directReader)
+            }
 
             let effectiveStartAt = env.settings.enableResumePlayback ? startAt : 0
             try await engine.load(
@@ -557,17 +570,10 @@ struct PlayerScreenView: View {
                 showTopNotice("已从 \(formatTime(effectiveStartAt)) 继续播放")
             }
 
-            let localScrub = scrubEngine
-            let streamURL = registered.url
-            let smbProvider = provider as? AMSMB2Provider
-            let itemPath = item.path
-            scrubPrepareTask?.cancel()
-            scrubPrepareTask = Task.detached(priority: .userInitiated) {
-                let directReader = try? await smbProvider?.openSynchronousScrubReader(at: itemPath)
-                await localScrub.prepare(url: streamURL, directReader: directReader)
-            }
             scheduleHUDHide()
-            await loadSubtitles(provider: provider, for: item)
+            Task { @MainActor in
+                await loadSubtitles(provider: provider, for: item)
+            }
         } catch {
             isLoadingMedia = false
             loadError = error.localizedDescription
@@ -760,7 +766,7 @@ struct PlayerScreenView: View {
             if let token {
                 env.proxy.setScrubMode(false, for: token)
             }
-            await engine.seek(to: finalTarget, precise: true)
+            await engine.seek(to: finalTarget, precise: false)
             engine.setMuted(false)
             engine.play()
         }

@@ -67,7 +67,7 @@ public final class AVPlayerEngineAdapter: NSObject, ObservableObject, PlayerEngi
 
     public func load(url: URL, startAt time: TimeInterval) async throws {
         loadStart = Date()
-        let asset = AVURLAsset(url: url, options: [AVURLAssetPreferPreciseDurationAndTimingKey: true])
+        let asset = AVURLAsset(url: url, options: [AVURLAssetPreferPreciseDurationAndTimingKey: false])
         let item = AVPlayerItem(asset: asset)
         item.preferredForwardBufferDuration = 6
         if let endObserver {
@@ -93,24 +93,28 @@ public final class AVPlayerEngineAdapter: NSObject, ObservableObject, PlayerEngi
         duration = seconds.isFinite ? seconds : 0
         self.loadedDuration = duration
 
-        if let info = await Self.probeTechnicalInfo(asset: asset) {
-            videoFormatDescription = info.formatDescription
-            stats = PlaybackStats(
-                engineName: "AVPlayer",
-                videoCodec: info.codec,
-                resolution: "\(info.width)x\(info.height)",
-                dynamicRange: info.dynamicRange,
-                frameRate: info.frameRate,
-                isHardwareDecoding: true
-            )
-        }
-
-        await refreshTracks(for: item)
-
         if time > 0 {
-            await seek(to: time, precise: true)
+            await seek(to: time, precise: false)
         }
         play()
+
+        Task { @MainActor [weak self] in
+            guard let self, self.currentItem === item else { return }
+            if let info = await Self.probeTechnicalInfo(asset: asset) {
+                guard self.currentItem === item else { return }
+                self.videoFormatDescription = info.formatDescription
+                self.stats = PlaybackStats(
+                    engineName: "AVPlayer",
+                    videoCodec: info.codec,
+                    resolution: "\(info.width)x\(info.height)",
+                    dynamicRange: info.dynamicRange,
+                    frameRate: info.frameRate,
+                    isHardwareDecoding: true
+                )
+            }
+            guard self.currentItem === item else { return }
+            await self.refreshTracks(for: item)
+        }
     }
 
     private func refreshTracks(for item: AVPlayerItem) async {
